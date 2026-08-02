@@ -50,15 +50,25 @@ jobs:
           C="$clang -nostdinc++ -isystem $pkgroot/include/c++/v1 --sysroot=$(xcrun --show-sdk-path) -mmacosx-version-min=14.0"
           runit() { if ./"$1" >/tmp/out.txt 2>&1; then echo "$2 exit: 0 :: $(head -1 /tmp/out.txt)"; else echo "$2 exit: $? :: $(head -1 /tmp/out.txt)"; fi; }
           set +e
-          echo "=== rebuild S4 + backtrace ==="
+          echo "=== S4 force_init ctor disasm (0x10000ac0c) ==="
+          printf 'settings set target.disable-aslr true\nrun\ndisassemble -s 0x10000ac0c -c 40\n' > /tmp/s4d.lldb
+          lldb -b -s /tmp/s4d.lldb -- ./ut_s4 2>&1 | sed -n '/disassemble/,$p' | head -45 || true
+          echo "=== S5: purview inline DoIOSInit var directly ==="
           cppm=$(find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut" -path '*generated*/boost.ut.cppm' | head -1)
-          cp "$cppm" /tmp/guarded7.cppm
-          python3 -c "p='/tmp/guarded7.cppm'; s=open(p).read(); g='\n// S4: external DoIOSInit decl in GMF\nnamespace std { namespace __1 { class DoIOSInit { public: DoIOSInit(); }; } }\n'; m='export module boost.ut;'; assert m in s; s=s.replace(m, g+m); g2='\n// S4: purview inline guard var (inline => initializer emitted, like cfg)\nnamespace ut_streams {\nstruct [[maybe_unused]] force_init { force_init() { static std::__1::DoIOSInit i; } };\ninline force_init ut_force_ios_init{};\n}\n'; m2='#define BOOST_UT_CXX_MODULES 1'; assert m2 in s; s=s.replace(m2, g2+m2); open(p,'w').write(s); print('S4 injected')"
+          cp "$cppm" /tmp/guarded8.cppm
+          python3 -c "p='/tmp/guarded8.cppm'; s=open(p).read(); g='\n// S5: external DoIOSInit decl in GMF\nnamespace std { namespace __1 { class DoIOSInit { public: DoIOSInit(); }; } }\n'; m='export module boost.ut;'; assert m in s; s=s.replace(m, g+m); g2='\n// S5: purview inline DoIOSInit var (inline => initializer emitted, like cfg)\nnamespace ut_streams { inline std::__1::DoIOSInit ut_doios{}; }\n'; m2='#define BOOST_UT_CXX_MODULES 1'; assert m2 in s; s=s.replace(m2, g2+m2); open(p,'w').write(s); print('S5 injected')"
           inc=$(python3 -c "import json;args=json.load(open('$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'];print(' '.join(a for a in args if a.startswith('-I')))")
           stdpcm=$(ls pcm.cache/std.pcm 2>/dev/null)
-          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded7.cppm -o obj/guarded7.m.o 2>&1 | tail -8 || true
-          $C -o ut_s4 obj/ut.o obj/guarded7.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
-          runit ut_s4 "S4(inline force_init)"
-          echo "=== S4 backtrace (where does it crash now) ==="
-          printf 'settings set target.disable-aslr true\nrun\nbt\nregister read pc x0 x1 x2\n' > /tmp/s4c.lldb
-          lldb -b -s /tmp/s4c.lldb -- ./ut_s4 2>&1 | grep -E "frame #|stop reason|-> |ut_s4\`|libc\+\+|dyld\`" | head -30 || true
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded8.cppm -o obj/guarded8.m.o 2>&1 | tail -8 || true
+          $C -o ut_s5 obj/ut.o obj/guarded8.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
+          runit ut_s5 "S5(inline DoIOSInit)"
+          if [ -f ut_s5 ]; then
+            echo "=== S5 init order ==="
+            offs=$(otool -s __TEXT __init_offsets ut_s5 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
+            printf 'settings set target.disable-aslr true\nrun\n' > /tmp/s5.lldb
+            for off in $offs; do printf 'image lookup -a 0x%x\n' $((0x100000000 + 16#$off)) >> /tmp/s5.lldb; done
+            lldb -b -s /tmp/s5.lldb -- ./ut_s5 2>&1 | grep -E "Summary:" | head -30 || true
+            echo "=== S5 backtrace if crashed ==="
+            printf 'settings set target.disable-aslr true\nrun\nbt\n' > /tmp/s5b.lldb
+            lldb -b -s /tmp/s5b.lldb -- ./ut_s5 2>&1 | grep -E "frame #|stop reason|-> " | head -15 || true
+          fi
