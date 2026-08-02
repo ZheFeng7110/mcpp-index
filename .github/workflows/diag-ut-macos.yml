@@ -38,7 +38,7 @@ jobs:
           echo "BIN=$bin"
           echo "=== otool -L (static vs dylib) ==="
           otool -L "$bin" 2>/dev/null || true
-      - name: streamtest init disasm + S2 DoIOSInit ctor experiment
+      - name: S3 module-linkage DoIOSInit guard
         shell: bash
         env:
           MCPP_INDEX_MIRROR: GLOBAL
@@ -49,33 +49,30 @@ jobs:
           cd "$d"
           C="$clang -nostdinc++ -isystem $pkgroot/include/c++/v1 --sysroot=$(xcrun --show-sdk-path) -mmacosx-version-min=14.0"
           runit() { if ./"$1" >/tmp/out.txt 2>&1; then echo "$2 exit: 0 :: $(head -1 /tmp/out.txt)"; else echo "$2 exit: $? :: $(head -1 /tmp/out.txt)"; fi; }
-          echo "=== build streamtest again for disasm ==="
-          printf '#include <iostream>\nstatic std::ios_base::Init g_ios;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > /tmp/streamtest.cpp
-          $C -O0 -g -c /tmp/streamtest.cpp -o /tmp/streamtest.o 2>&1 | tail -2 || true
-          $C -o /tmp/streamtest /tmp/streamtest.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
-          runit /tmp/streamtest "ST(plain)"
-          printf 'settings set target.disable-aslr true\nrun\nbt\n' > /tmp/s.lldb
+          echo "=== streamtest direct run + init disasm ==="
+          /tmp/streamtest >/dev/null 2>&1; echo "streamtest exit: $?"
           offs=$(otool -s __TEXT __init_offsets /tmp/streamtest 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
           echo "streamtest init offsets: $offs"
-          i=0
-          for off in $offs; do
-            i=$((i+1))
-            printf 'disassemble -s 0x%x -c 30\n' $((0x100000000 + 16#$off)) >> /tmp/s.lldb
-          done
-          lldb -b -s /tmp/s.lldb -- /tmp/streamtest 2>&1 | sed -n '/disassemble/,$p' | grep -E "0x100000|bl |->" | head -50 || true
-          echo "=== S2: GMF ctor constructing std::__1::DoIOSInit directly ==="
+          printf 'settings set target.disable-aslr true\nrun\n' > /tmp/s.lldb
+          for off in $offs; do printf 'disassemble -s 0x%x -c 40\n' $((0x100000000 + 16#$off)) >> /tmp/s.lldb; done
+          lldb -b -s /tmp/s.lldb -- /tmp/streamtest 2>&1 | grep -E "0x1000000|bl |->|Summary" | head -50 || true
+          echo "=== S3: purview module-linkage force_init object calling DoIOSInit ==="
           cppm=$(find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut" -path '*generated*/boost.ut.cppm' | head -1)
-          cp "$cppm" /tmp/guarded4.cppm
-          python3 -c "p='/tmp/guarded4.cppm'; s=open(p).read(); g='\n// S2: force libc++ stream construction via its internal DoIOSInit\nnamespace std { namespace __1 { class DoIOSInit { public: DoIOSInit(); }; } }\n__attribute__((constructor)) static void ut_force_ios_init() { static std::__1::DoIOSInit i; }\n'; m='export module boost.ut;'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('S2 injected')"
+          cp "$cppm" /tmp/guarded5.cppm
+          python3 -c "p='/tmp/guarded5.cppm'; s=open(p).read(); g='\n// S3: module-linkage guard whose ctor constructs libc++ internal DoIOSInit\nnamespace std { namespace __1 { class DoIOSInit { public: DoIOSInit(); }; } }\nnamespace ut_streams {\nstruct [[maybe_unused]] force_init { force_init() { static std::__1::DoIOSInit i; } };\n[[maybe_unused]] force_init ut_force_ios_init{};\n}\n'; m='#define BOOST_UT_CXX_MODULES 1'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('S3 injected')"
           inc=$(python3 -c "import json;args=json.load(open('$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'];print(' '.join(a for a in args if a.startswith('-I')))")
           stdpcm=$(ls pcm.cache/std.pcm 2>/dev/null)
-          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded4.cppm -o obj/guarded4.m.o 2>&1 | tail -6 || true
-          $C -o ut_s2 obj/ut.o obj/guarded4.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
-          runit ut_s2 "S2(DoIOSInit ctor)"
-          if [ -f ut_s2 ]; then
-            echo "=== S2 init order ==="
-            offs=$(otool -s __TEXT __init_offsets ut_s2 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
-            printf 'settings set target.disable-aslr true\nrun\n' > /tmp/s2.lldb
-            for off in $offs; do printf 'image lookup -a 0x%x\n' $((0x100000000 + 16#$off)) >> /tmp/s2.lldb; done
-            lldb -b -s /tmp/s2.lldb -- ./ut_s2 2>&1 | grep -E "Summary:" | head -30 || true
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded5.cppm -o obj/guarded5.m.o 2>&1 | tail -8 || true
+          $C -o ut_s3 obj/ut.o obj/guarded5.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
+          runit ut_s3 "S3(module-linkage DoIOSInit)"
+          if [ -f ut_s3 ]; then
+            echo "=== S3 init order ==="
+            offs=$(otool -s __TEXT __init_offsets ut_s3 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
+            printf 'settings set target.disable-aslr true\nrun\n' > /tmp/s3.lldb
+            for off in $offs; do printf 'image lookup -a 0x%x\n' $((0x100000000 + 16#$off)) >> /tmp/s3.lldb; done
+            lldb -b -s /tmp/s3.lldb -- ./ut_s3 2>&1 | grep -E "Summary:" | head -30 || true
+            echo "=== S3 first guarded5 init disasm ==="
+            off=$(echo $offs | awk '{print $3}')
+            printf 'settings set target.disable-aslr true\nrun\ndisassemble -s 0x%x -c 25\n' $((0x100000000 + 16#$off)) > /tmp/s3b.lldb
+            lldb -b -s /tmp/s3b.lldb -- ./ut_s3 2>&1 | sed -n '/disassemble/,$p' | head -30 || true
           fi
