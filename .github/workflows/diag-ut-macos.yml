@@ -93,8 +93,15 @@ jobs:
           echo "=== M2: xpkg dylib + rpath ==="
           $C -o ut_m2 obj/ut.o obj/boost.ut.m.o -L"$pkgroot/lib" -lc++ -lc++abi -Wl,-rpath,"$pkgroot/lib" 2>&1 | tail -5 || true
           runit ut_m2 "M2(xpkg dylib+rpath)"
-          echo "=== K init_offsets symbolization ==="
-          offs=$(otool -s __TEXT __init_offsets ut_k 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
-          printf 'settings set target.disable-aslr true\nrun\n' > /tmp/y.lldb
-          for off in $offs; do addr=$((16#$off)); printf 'image lookup -a 0x%x\n' $((0x100000000 + addr)) >> /tmp/y.lldb; done
-          lldb -b -s /tmp/y.lldb -- ./ut_k 2>&1 | grep -E "image lookup -a|Summary:|Function:" | head -80 || true
+          echo "=== K backtrace + guard disasm ==="
+          printf 'settings set target.disable-aslr true\nrun\nbt\nregister read pc x0 x1\n' > /tmp/z.lldb
+          lldb -b -s /tmp/z.lldb -- ./ut_k 2>&1 | tail -45 || true
+          echo "=== K guard init disasm (0x100020534 = first guarded.cppm init) ==="
+          printf 'settings set target.disable-aslr true\nrun\ndisassemble -s 0x100020534 -c 25\n' > /tmp/w.lldb
+          lldb -b -s /tmp/w.lldb -- ./ut_k 2>&1 | tail -40 || true
+          echo "=== O runtime init order ==="
+          DYLD_PRINT_INITIALIZERS=1 ./ut_o 2>&1 | grep -v "^dyld\[" | head -8 || true
+          DYLD_PRINT_INITIALIZERS=1 ./ut_o 2>&1 | grep "^dyld\[" | head -40 || true
+          echo "=== O abort backtrace ==="
+          printf 'settings set target.disable-aslr true\nrun\nbt all\n' > /tmp/v.lldb
+          lldb -b -s /tmp/v.lldb -- ./ut_o 2>&1 | tail -50 || true
