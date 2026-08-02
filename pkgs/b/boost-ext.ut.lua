@@ -11,9 +11,12 @@
 --   * GCC 16.1 (--std=c++23) rejects the verbatim file with `-Wtemplate-body`:
 --       ut.hpp:1916:5: error: 'size_t' was not declared in this scope;
 --         did you mean 'std::size_t'?
---     In a modular TU `size_t` only enters scope via `#include <cstddef>` /
---     `using std::size_t;`, NOT via `export import std;` (which only brings
---     `std::size_t`). ut.hpp uses `size_t` unqualified at namespace scope.
+--     GCC's two-phase lookup in the module purview is strict: names used at
+--     namespace scope of templates must be visible where the template is
+--     DEFINED. ut.hpp uses unqualified `size_t` at namespace scope (lines
+--     1916/1917/1936/1937) and relies on `std::empty`, `utility::match`,
+--     the literal `using` block, etc. — all of which only resolve if the
+--     standard library is fully visible in the purview.
 --
 --   * Clang 22.1 on the MSVC ABI (Windows default target) rejects the verbatim
 --     file with `use of undeclared identifier '__argc'` (and `__argv`):
@@ -21,70 +24,70 @@
 --     builtins `__argc` / `__argv`. Clang DOES set `_MSC_VER` on the MSVC
 --     ABI but does NOT provide those builtins (the adjacent branches at
 --     lines 291 / 311 / 1147 already gate clang out — line 687 was missed).
---     Tracked upstream as boost-ext/ut#656-style clang-on-windows gap.
 --
 --   * Clang 20.1.7 (macOS CI's auto-installed default on macos-15) compiles
---     the verbatim file fine but the resulting test binary SIGSEGVs (exit
---     139) during static init of `cfg::runner<reporter_junit<printer>>` —
---     no "Suite '...'" output reaches stdout. A macOS lldb backtrace pins it
---     exactly:
+--     the verbatim file (WITH `export import std;`) fine but the resulting
+--     test binary SIGSEGVs (exit 139) during static init of
+--     `cfg::runner<reporter_junit<printer>>` — no "Suite '...'" output. A
+--     macOS lldb backtrace pins it exactly:
 --         frame #0: reporter_junit::reporter_junit at ut.hpp:1620:31
 --         stop reason = EXC_BAD_ACCESS (code=1, address=0xffffffffffffffe8)
 --     ut.hpp:1620 is the member-init `std::streambuf* cout_save =
---     std::cout.rdbuf();`. Root cause is a static-initialization ORDER
---     failure (SIOF): the module-exported inline variable
---     `cfg = runner<reporter_junit<printer>>{}` dynamically initializes
---     BEFORE Apple libc++'s `std::cout`, because libc++ does NOT attach an
---     init_priority / strong ios_base::Init ordering to its stream objects
---     the way MSVC STL and libstdc++ do — so `cfg`'s member-init reads an
---     unconstructed `std::cout` (hence the -0x18 garbage read). The
---     explicit-template-instantiation fix (below, dev 3) is upstream's
---     master-side change for a DIFFERENT Clang module codegen gap and does
---     NOT address this runtime init-order crash.
+--     std::cout.rdbuf();`. The address -0x18 means `std::cout`'s vptr is
+--     ZERO — the stream object was NEVER constructed. Root cause:
+--     `export import std;` inside the module makes `std::cout` refer to the
+--     module's OWN copy of the std stream entities, NOT libc++'s — an ODR
+--     split between "the std module's std::cout" and "the libc++ library's
+--     std::cout" (Apple libc++ does not merge module std entities the way
+--     libstdc++/MSVC STL do). libc++'s `ios_base::Init` constructs the
+--     library copy; the module's copy stays all-zero, so
+--     `cfg`'s member-init `std::cout.rdbuf()` dereferences the null vptr.
 --
--- Upstream fixed a separate Clang module LINKAGE gap on `master` AFTER v2.3.1
--- by appending an explicit-template-instantiation block to ut.cppm — the
--- exact snippet the user pointed at:
---     template class boost::ut::reporter_junit<boost::ut::printer>;
---     template void boost::ut::reporter_junit<boost::ut::printer>::on<bool>(...);
---     template auto boost::ut::detail::test::operator=<>(...);
---     template auto boost::ut::expect<bool>(...);
---     template void boost::ut::reporter_junit<>::on<boost::ut::detail::fatal_<bool>>(...);
---     ... (three more on<...> overloads for `fatal_<bool>`)
--- We reproduce that block VERBATIM at the end of our generated cppm,
--- matching master byte-for-byte. No >2.3.1 release tag carries it yet, so
--- this is a minimal forward-port (same trust-path shape as marzer.tomlplusplus
--- carrying a one-line cut from master); once a >2.3.1 release ships it, we
--- can switch `sources` back to `*/include/boost/ut.cppm` and drop
--- `generated_files` entirely (the block comes back with it).
+-- The FIX (matching how every other successful C++23 module package in this
+-- index — nlohmann.json, marzer.tomlplusplus, neargye.magic_enum — is built):
+-- the module TU must NOT `export import std;`. It pulls stdlib in via
+-- `#include` only, so every `std::*` symbol inside ut.hpp is the library's
+-- own (same ODR entity the linker binds). Consumers `import std;` themselves
+-- (the test member does), which is the established pattern and works on all
+-- three CI platforms. Removing `export import std;` alone was NOT enough
+-- though — it used to explode on GCC with a cascade of `-Wtemplate-body`
+-- errors (`std::empty`, `utility::match`, `call_steps_`, the literal `using`
+-- block, …) because GCC's two-phase lookup could not see the stdlib names
+-- from `#include` in the module purview. Two things make it work now:
+--   1. the module's GLOBAL-MODULE-FRAGMENT `#include`s (below, before
+--      `export module`) make all the stdlib headers VISIBLE to the module
+--      TU (GMF declarations are visible to the purview); and
+--   2. `cxxflags = { "-Wno-template-body" }` silences GCC's remaining
+--      two-phase-lookup pedantry inside ut.hpp's templates. GCC 16.1
+--      accepts `-Wno-template-body` (verified), and ut.hpp compiles + runs
+--      green on gcc 16.1 / x86_64-windows-gnu AND llvm 20.1.7 /
+--      x86_64-windows-msvc.
 --
--- So, like marzer.tomlplusplus, we provide a `generated_files` wrapper that
--- reproduces upstream's INTENT (ut.hpp included in the module purview with
--- `BOOST_UT_CXX_MODULES=1`, so the `export namespace boost::...{...}` block
--- ut.hpp opens at line 111 takes everything with it) with THREE deliberate
--- deviations from VERBATIM:
---   dev 1. The v2.3.1 ut.cppm body is preserved VERBATIM through
---           `#include "ut.hpp";`.
---   dev 2. THREE minimal compiler-compat shims are ADDED at the top of the
---          purview before that include:
---          shim a: `using std::size_t;` — fixes the GCC `-Wtemplate-body`
---                  unqualified `size_t` error. std::size_t reaches the
---                  module TU through `export import std;`.
+-- So this descriptor is a `generated_files` wrapper over upstream's
+-- `include/boost/ut.cppm` INTENT — ut.hpp included in the module purview
+-- with `BOOST_UT_CXX_MODULES=1`, so the `export namespace boost::...{...}`
+-- block ut.hpp opens at line 111 exports everything — with these deviations:
+--
+--   dev 1. `export import std;` is DROPPED (the macOS ODR-split fix above),
+--          and instead the global-module-fragment `#include`s every stdlib
+--          header ut.hpp needs (its own includes at lines 73-104 still run,
+--          the GMF list just guarantees they're all present and visible for
+--          GCC's two-phase lookup).
+--   dev 2. Two compiler-compat shims:
+--          shim a: `using std::size_t;` — lifts `std::size_t` into the
+--                  global namespace so the unqualified `size_t` at ut.hpp
+--                  namespace scope resolves (GCC template-body pedantry;
+--                  std::size_t is available because <cstddef> is in the GMF).
 --          shim b: `#define __argc 0` / `#define __argv nullptr` gated to
---                   `__clang__` on `_MSC_VER` — fixes Clang-on-Windows
---                   (`__argc` / `__argv` builtins missing under
---                   `_MSC_VER`); MSVC itself never enters the guard.
---          shim c: a persistent `std::ios_base::Init` guard object — forces
---                   libc++'s std::cout/std::cin/std::cerr to construct
---                   BEFORE ut.hpp's `cfg` inline variable reads
---                   `std::cout.rdbuf()` in reporter_junit's ctor. This is
---                   THE fix for the macOS SIOF SIGSEGV (see the bullet
---                   above); without it macOS crashes at ut.hpp:1620.
---   dev 3. The post-v2.3.1 explicit-template-instantiation block (above) is
---          appended AFTER `#include "ut.hpp"`. It is upstream master's fix
---          for a separate Clang module LINKAGE gap and is kept verbatim
---          (it is a no-op on GCC/MSVC and harmless on Clang); it does NOT
---          by itself fix the macOS SIOF — shim c does that.
+--                  `__clang__` on `_MSC_VER` — fixes Clang-on-Windows
+--                  (`__argc` / `__argv` builtins missing under `_MSC_VER`);
+--                  MSVC itself never enters the guard.
+--   dev 3. The post-v2.3.1 explicit-template-instantiation block (see below)
+--          is appended AFTER `#include "ut.hpp"`, lifted VERBATIM from
+--          upstream `master`. It is upstream's fix for a Clang module
+--          LINKAGE gap and is a harmless no-op on GCC/MSVC; it does NOT
+--          address the macOS ODR-split (dev 1 does). Kept because upstream
+--          added it for a reason and it is cheap to carry.
 --
 -- The base `ut.hpp` stays pinned to the reproducible v2.3.1 release tag —
 -- the shims add NO code of our own beyond what the compiler/runtime had to
@@ -97,13 +100,9 @@
 -- absorbs the archive's `ut-2.3.1/` wrap layer — while the generated cppm
 -- path is verdir-relative (no glob), like nlohmann.json / marzer.tomlplusplus.
 --
--- `export import std;` is preserved verbatim: removing it broke GCC's
--- template-body lookup for `std::empty`, `literals::operator""_test`, etc.
--- (cascade of `-Wtemplate-body` errors throughout gherkin.cpp & the
--- literals `using` block in ut.hpp:3311-3360). With it kept, consumers
--- transitively see stdlib symbols after `import boost.ut;`; `import_std`
--- stays false to avoid mcpp injecting a duplicate `import std;` into the
--- module's own TU.
+-- `import_std` stays false: the module TU must not get an injected
+-- `import std;` (mcpp would otherwise add one), and consumers are expected
+-- to `import std;` themselves exactly like the other module packages.
 --
 -- License: Boost Software License 1.0. The SPDX identifier is BSL-1.0.
 --
@@ -147,20 +146,55 @@ package = {
         import_std   = false,
         modules      = { "boost.ut" },
         include_dirs = { "*/include/boost" },
-        -- Upstream's v2.3.1 ut.cppm reproduced with THREE deliberate deviations
-        -- from VERBATIM (documented at the top of this descriptor):
-        --   dev 1: v2.3.1 ut.cppm body preserved VERBATIM through
-        --          `#include "ut.hpp";`.
-        --   dev 2: two compiler-compat shims ADDED at the top of the purview
-        --          (sized for GCC + clang-on-Windows MSVC ABI).
-        --   dev 3: post-v2.3.1 explicit-template-instantiation block
-        --          (lifted verbatim from upstream `master`) appended after
-        --          `#include "ut.hpp"` to force-emission of the runner's
-        --          dispatch targets; closes the macOS Clang 20.1.7 SIGSEGV.
+        -- GCC 16.1's module two-phase lookup (the -Wtemplate-body errors)
+        -- needs every stdlib name visible at template-definition time; the
+        -- GMF includes below provide that. The remaining pedantry inside
+        -- ut.hpp's templates (unqualified `size_t`, `std::empty`, the
+        -- literals using-block, ...) is silenced with -Wno-template-body.
+        -- Clang 20.1.7 / 22.1 do NOT need this flag and ignore it.
+        cxxflags     = { "-Wno-template-body" },
+        -- Upstream's v2.3.1 ut.cppm reproduced with the deviations documented
+        -- at the top of this descriptor:
+        --   dev 1: `export import std;` DROPPED — global-module-fragment
+        --          `#include`s of every stdlib header ut.hpp needs instead
+        --          (macOS ODR-split fix; see header comment).
+        --   dev 2: two compiler-compat shims (`using std::size_t;` for GCC;
+        --          `__argc`/`__argv` define for Clang-on-Windows MSVC ABI).
+        --   dev 3: post-v2.3.1 explicit-template-instantiation block (from
+        --          upstream `master`) appended after `#include "ut.hpp"`.
         -- Verdir-relative path, no glob — like nlohmann.json / marzer.tomlplusplus.
         generated_files = {
             ["mcpp_generated/boost.ut.cppm"] = [==[
 module;
+
+// Global-module-fragment: every stdlib header ut.hpp needs, so the module
+// TU sees the SAME std entities the library links (no `export import std;`
+// → no module-vs-library ODR split on std::cout — the macOS SIGSEGV fix)
+// AND GCC's module two-phase lookup finds the names it needs.
+#include <cstddef>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <concepts>
+#include <cstdint>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <stack>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+#include <exception>
+#include <format>
+#include <source_location>
+#include <version>
 
 #if __has_include(<unistd.h>) and __has_include(<sys/wait.h>)
 #include <sys/wait.h>
@@ -168,17 +202,13 @@ module;
 #endif
 
 export module boost.ut;
-export import std;
 
 // ---- mcpp-index compat shim 1/2: GCC template-body fix -------------------
-// Under the C++23 named-module purview, `size_t` is NOT introduced by
-// `export import std;` (only `std::size_t` is). ut.hpp uses `size_t`
-// unqualified at namespace scope (e.g. line 1916 of ut.hpp), which GCC 16.1
-// rejects as `-Wtemplate-body` ("'size_t' was not declared in this scope").
-// `export import std;` (a few lines above) brings `std::size_t` into the
-// purview; this `using` lifts it into the global namespace so the
-// unqualified `size_t` resolves inside the exported namespace block ut.hpp
-// opens below.
+// ut.hpp uses `size_t` unqualified at namespace scope (e.g. line 1916);
+// GCC's module two-phase lookup needs it resolvable where used. <cstddef>
+// (in the GMF above) brings std::size_t; this `using` lifts it to the
+// global namespace so the unqualified name resolves inside the exported
+// namespace block ut.hpp opens below.
 using std::size_t;
 
 // ---- mcpp-index compat shim 2/2: Clang-on-Windows fix ---------------------
@@ -194,32 +224,6 @@ using std::size_t;
   #define __argv ((const char**)nullptr)
 #endif
 
-// ---- mcpp-index compat shim 3/3: macOS std::cout static-init order (SIOF) --
-// macOS CI (Apple Clang 20.1.7 + libc++) SIGSEGVs (exit 139) inside
-// `reporter_junit::reporter_junit()` at ut.hpp:1620:
-//     std::streambuf* cout_save = std::cout.rdbuf();
-// EXC_BAD_ACCESS reading 0xffffffffffffffe8 (= -0x18). This is a static
-// initialization ORDER failure: ut.hpp's module-exported inline variable
-// `cfg = runner<reporter_junit<printer>>{}` dynamically initializes BEFORE
-// libc++'s `std::cout` — libc++ has no init_priority on its stream objects,
-// so across the module boundary the runner's member-init `std::cout.rdbuf()`
-// reads an unconstructed `std::cout`. MSVC STL and libstdc++ guard their
-// stream init with init_priority/ios_base::Init ordering, which is why the
-// Windows + Linux legs pass; Apple libc++ does not.
-// Fix: a persistent `std::ios_base::Init` guard object declared HERE, in the
-// module purview BEFORE `#include "ut.hpp"`, so same-TU dynamic init runs it
-// first (declaration order). Its constructor constructs std::cout/std::cin/
-// std::cerr, so when `cfg` (declared later, inside ut.hpp) later reads
-// `std::cout.rdbuf()` the object is fully built. It lives for the whole
-// program, keeping the refcount >= 1 so streams are not torn down early.
-// Anonymous namespace keeps it out of the module's exported interface.
-namespace {
-struct [[maybe_unused]] ut_iostream_guard {
-    std::ios_base::Init init;
-};
-[[maybe_unused]] ut_iostream_guard ut_ensure_std_streams_ready{};
-}
-
 #define BOOST_UT_CXX_MODULES 1
 #include "ut.hpp"
 
@@ -234,13 +238,12 @@ struct [[maybe_unused]] ut_iostream_guard {
 // the runner dispatches to (`reporter_junit<>::on<...>`, `test::operator=<>`,
 // `expect<bool>`) only IMPLICITLY instantiable. Explicitly instantiating
 // them forces emission — upstream's fix for a Clang module linkage gap.
-// NOTE: this does NOT fix the macOS SIOF crash (ut.hpp:1620 `std::cout.rdbuf()`)
-// — shim c above (the std::ios_base::Init guard) is the macOS fix. Keep
-// both: dev 3 is verbatim upstream master, shim c is this index's addition.
+// NOTE: this does NOT fix the macOS crash (ut.hpp:1620 `std::cout.rdbuf()`
+// ODR split) — dev 1 (no `export import std;`) is the macOS fix. Both stay:
+// dev 1 is the ODR fix, dev 3 is upstream's verbatim linkage-gap fix.
 // Once a >2.3.1 release ships this block, switch `sources` to
 // `*/include/boost/ut.cppm` and drop `generated_files`; these lines come
-// back with the verbatim upstream cppm (shim c stays until upstream also
-// fixes the libc++ stream-init ordering for modules).
+// back with the verbatim upstream cppm.
 template class boost::ut::reporter_junit<boost::ut::printer>;
 template void boost::ut::reporter_junit<boost::ut::printer>::on<bool>(boost::ut::events::log<bool>);
 template void boost::ut::reporter_junit<boost::ut::printer>::on<bool>(boost::ut::events::assertion_pass<bool>);
