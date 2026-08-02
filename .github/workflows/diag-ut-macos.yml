@@ -121,7 +121,14 @@ jobs:
           done
           lldb -b -s /tmp/w.lldb -- ./ut_k2 2>&1 | sed -n '/disassemble/,$p' | head -35 || true
           echo "=== mcpp link command (verbose full) ==="
-          "$MCPP" test -p boost-ext.ut -v 2>&1 | grep -iE "clang\+\+|ld |-o |libc\+\+" | head -15 || true
+          "$MCPP" test -p boost-ext.ut -v > /tmp/mcpp_v.log 2>&1 || true
+          grep -nE "clang\+\+.*(-o|\.o)|\.a |libc\+\+|static" /tmp/mcpp_v.log | head -20 || echo "(no link line found)"
+          echo "--- full tail of verbose log ---"
+          tail -30 /tmp/mcpp_v.log || true
+          echo "=== mcpp build artifacts ==="
+          find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/.mcpp" -maxdepth 3 -name "*link*" -o -maxdepth 3 -name "*build*" -o -maxdepth 3 -name "*.ninja" 2>/dev/null | head -10 || true
+          echo "=== ninja/build log for link cmd ==="
+          find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/.mcpp" -name "*.log" 2>/dev/null | head -5 || true
           echo "=== M3: system dylib ONLY via mcpp-style link (sanity: E variant) ==="
           $C -o ut_e2 obj/ut.o obj/boost.ut.m.o 2>&1 | tail -3 || true
           runit ut_e2 "E2(dylib only)"
