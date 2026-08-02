@@ -38,24 +38,22 @@ jobs:
           echo "BIN=$bin"
           echo "=== otool -L (static vs dylib) ==="
           otool -L "$bin" 2>/dev/null || true
-      - name: toolchain & link introspection
+      - name: build.ninja + macosx toolchain cfg
         shell: bash
         env:
           MCPP_INDEX_MIRROR: GLOBAL
         run: |
           MCPPROOT="$PWD/mcpp-0.0.109-macosx-arm64"
           XP="$MCPPROOT/registry/data/xpkgs/xim-x-llvm/20.1.7"
-          echo "=== .xpkg.lua (toolchain descriptor, full) ==="
-          cat "$XP/.xpkg.lua" 2>/dev/null | head -300 || true
-          echo "=== .mcpp-fixup.json ==="
-          cat "$XP/.mcpp-fixup.json" 2>/dev/null || true
-          echo "=== MCPP_LOG_LEVEL=debug: link command ==="
-          MCPP_LOG_LEVEL=debug "$MCPP" test -p boost-ext.ut > /tmp/mcpp_dbg.log 2>&1 || true
-          grep -niE "clang\+\+.*(-o |libc)|link|ld " /tmp/mcpp_dbg.log | grep -viE "\.md|\.txt|\.hpp|CMake|README|include/|\.lua" | head -25 || true
-          echo "=== MCPP_LOG_LEVEL=trace attempt ==="
-          MCPP_LOG_LEVEL=trace "$MCPP" test -p boost-ext.ut > /tmp/mcpp_trc.log 2>&1 || true
-          grep -niE "clang\+\+.*(-o |\.a)" /tmp/mcpp_trc.log | head -25 || true
-          echo "=== ninja/rsp files anywhere under member ==="
-          find tests/examples/boost-ext.ut -type f \( -name "*.ninja" -o -name "*.rsp" -o -name "*.txt" \) 2>/dev/null | grep -viE "target/aarch64-macos/0fbb0b71bd39a150/(obj|bin)/" | head -20 || true
-          ls -la tests/examples/boost-ext.ut/.mcpp/ 2>/dev/null | head -20 || true
-          find tests/examples/boost-ext.ut/.mcpp -maxdepth 3 2>/dev/null | head -40 || true
+          ninja_file=$(find tests/examples/boost-ext.ut/target -name "build.ninja" | head -1)
+          echo "NINJA=$ninja_file"
+          echo "=== build.ninja size ==="
+          wc -l "$ninja_file" 2>/dev/null || true
+          echo "=== link-related rules ==="
+          grep -nE "rule |command =|libc\+\+|\.a |\.dylib|-o " "$ninja_file" 2>/dev/null | head -50 || true
+          echo "=== build.ninja full (head 200) ==="
+          head -200 "$ninja_file" 2>/dev/null || true
+          echo "=== xpkg macosx section ==="
+          grep -nA 40 '"macosx"\|macosx =' "$XP/.xpkg.lua" 2>/dev/null | head -60 || true
+          echo "=== xpkg llvm compiler/link model section ==="
+          grep -nB2 -A30 "link model\|link_rules\|toolchain\|compiler" "$XP/.xpkg.lua" 2>/dev/null | head -80 || true
