@@ -89,9 +89,25 @@ jobs:
           printf 'settings set target.disable-aslr true\nrun\n' > /tmp/y.lldb
           for off in $offs; do addr=$((16#$off)); printf 'image lookup -a 0x%x\n' $((0x100000000 + addr)) >> /tmp/y.lldb; done
           lldb -b -s /tmp/y.lldb -- ./ut_k2 2>&1 | grep -E "image lookup -a|Summary:|Function:" | head -80 || true
-          echo "=== K2 backtrace (if crashed) ==="
-          printf 'settings set target.disable-aslr true\nrun\nbt\n' > /tmp/z.lldb
-          lldb -b -s /tmp/z.lldb -- ./ut_k2 2>&1 | grep -E "frame #|stop reason|-> " | head -25 || true
+          echo "=== K2 guard init (.97) disasm ==="
+          printf 'settings set target.disable-aslr true\nrun\n' > /tmp/w.lldb
+          printf 'image lookup -a 0x%x\ndisassemble -s 0x%x -c 30\n' 0x0 0x0 >> /tmp/w.lldb
+          offs=$(otool -s __TEXT __init_offsets ut_k2 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
+          i=0
+          for off in $offs; do
+            i=$((i+1))
+            if [ $i -eq 3 ]; then printf 'disassemble -s 0x%x -c 30\n' $((0x100000000 + 16#$off)) >> /tmp/w.lldb; fi
+          done
+          lldb -b -s /tmp/w.lldb -- ./ut_k2 2>&1 | grep -E "ut_k2\`|bl |0x100" | head -40 || true
+          echo "=== S: __attribute__((constructor)) fn in GMF, static link ==="
+          cp "$cppm" /tmp/guarded3.cppm
+          python3 -c "p='/tmp/guarded3.cppm'; s=open(p).read(); g='\n// GMF ctor: force libc++ stream construction before ut cfg\n__attribute__((constructor)) static void ut_force_ios_init() { std::ios_base::Init i; }\n'; m='export module boost.ut;'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('ctor injected')"
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded3.cppm -o obj/guarded3.m.o 2>&1 | tail -6 || true
+          $C -o ut_s obj/ut.o obj/guarded3.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
+          runit ut_s "S(GMF ctor static)"
+          echo "=== mcpp full link command ==="
+          "$MCPP" test -p boost-ext.ut 2>&1 | grep -iE "link|clang\+\+.*-o|\.a|\.dylib" | head -10 || true
+          find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/.mcpp" -name "*.log" -o -name "*.txt" -o -name "*.rsp" 2>/dev/null | head -10 || true
           echo "=== O: libc++.a BEFORE user objects ==="
           $C -o ut_o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" obj/ut.o obj/boost.ut.m.o 2>&1 | tail -5 || true
           runit ut_o "O(archive first)"
