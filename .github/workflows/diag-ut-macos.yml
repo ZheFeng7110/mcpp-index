@@ -27,43 +27,61 @@ jobs:
           echo "MCPP=$root/bin/mcpp" >> "$GITHUB_ENV"
           echo "MCPP_VENDORED_XLINGS=$root/registry/bin/xlings" >> "$GITHUB_ENV"
           echo "$root/bin" >> "$GITHUB_PATH"
-      - name: mcpp test (collect crash)
+      - name: mcpp test + symbol forensics
         shell: bash
         env:
           MCPP_INDEX_MIRROR: GLOBAL
         run: |
           "$MCPP" --version
           "$MCPP" test -p boost-ext.ut || true
-          bin=$(find tests/examples/boost-ext.ut/target -name 'ut' -type f 2>/dev/null | head -1)
-          echo "BIN=$bin"
-          if [ -n "$bin" ]; then
-            echo "=== otool -L ==="
-            otool -L "$bin" || true
-            echo "=== nm: cout / stream / init symbols ==="
-            nm -nm "$bin" 2>/dev/null | grep -iE "cout|iostream|DoIOSInit|start_std_streams|ios_base" || true
-            echo "=== DYLD_PRINT_INITIALIZERS ==="
-            DYLD_PRINT_INITIALIZERS=1 "$bin" 2>&1 | tail -100 || true
-            echo "=== lldb deep ==="
-            printf 'run\nbt\nregister read pc sp x0\ndisassemble --pc\nimage lookup -rn "cout"\nimage lookup -rn "DoIOSInit"\nimage lookup -rn "start_std_streams"\nimage lookup -rn "reporter_junit"\n' > ut.lldb
-            lldb -b -s ut.lldb -- "$bin" 2>&1 | tail -250 || true
-            echo "=== compile_commands (module build flags) ==="
-            find tests/examples/boost-ext.ut -name 'compile_commands.json' -exec cat {} \; 2>/dev/null | head -80 || true
-          fi
-      - name: minimal module repro (same toolchain)
+          echo "=== locate binary/objs ==="
+          dir=tests/examples/boost-ext.ut/target/aarch64-macos
+          d=$(ls -d $dir/*/ | head -1)
+          echo "TARGETDIR=$d"
+          bin="$d/bin/ut"
+          echo "=== module object: cout references ==="
+          nm -nm "$d/obj/boost.ut.m.o" 2>/dev/null | grep -iE "cout|ios_base" || echo "(none)"
+          echo "=== module object: all undefined ==="
+          nm -u "$d/obj/boost.ut.m.o" 2>/dev/null | grep -iE "cout" || echo "(no cout undefined)"
+          echo "=== test object: cout references ==="
+          nm -nm "$d/obj/ut.o" 2>/dev/null | grep -iE "cout|ios_base" || echo "(none)"
+          echo "=== binary: undefined symbols (cout/init) ==="
+          nm -u "$bin" 2>/dev/null | grep -iE "cout|ios_base|Init" || echo "(none)"
+          echo "=== binary: defined data (cout) ==="
+          nm -nm "$bin" 2>/dev/null | grep -iE "cout" | grep -iE "data|const|common" || echo "(no cout data symbol)"
+          echo "=== binary: __mod_init_func count ==="
+          otool -l "$bin" | grep -A3 "mod_init_func" || echo "(no mod_init_func)"
+          echo "=== link flags (verbose mcpp) ==="
+          "$MCPP" test -p boost-ext.ut -v 2>&1 | grep -iE "clang|ld|libc|o bin" | tail -30 || true
+      - name: mini repro matrix with xpkg clang
         shell: bash
         env:
           MCPP_INDEX_MIRROR: GLOBAL
         run: |
-          clang=$(find "$HOME/.mcpp" tests/examples/boost-ext.ut/.mcpp -name 'clang++' -type f 2>/dev/null | head -1)
+          clang=$(python3 -c "import json;print(json.load(open('tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'][0])")
+          pkgroot=$(dirname $(dirname $clang))
           echo "CLANG=$clang"
+          echo "PKGROOT=$pkgroot"
+          ls "$pkgroot/lib" | head -20
           mkdir -p /tmp/repro && cd /tmp/repro
           printf 'module;\n#include <iostream>\nexport module mini;\nexport inline int the_stream = (std::cout.rdbuf() != nullptr) ? 1 : 0;\n' > mini.cppm
           printf 'import mini;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > main.cpp
-          printf 'import std;\nimport mini;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > main_importstd.cpp
-          "$clang" -std=c++23 --precompile mini.cppm -o mini.pcm && \
-            "$clang" -std=c++23 -fmodule-file=mini=mini.pcm main.cpp mini.pcm -o mini && \
-            ./mini; echo "mini(no import std) exit: $?"
-          "$clang" -std=c++23 -fmodule-file=mini=mini.pcm main_importstd.cpp mini.pcm -o mini2 && \
-            ./mini2; echo "mini(import std) exit: $?"
-          printf '#include <iostream>\ninline int h = (std::cout.rdbuf() != nullptr) ? 1 : 0;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > header.cpp
-          "$clang" -std=c++23 header.cpp -o header && ./header; echo "header-form exit: $?"
+          echo "--- mini A: no std.pcm, plain link ---"
+          "$clang" -std=c++23 --precompile mini.cppm -o a.pcm && \
+            "$clang" -std=c++23 -fmodule-file=mini=a.pcm main.cpp a.pcm -o a 2>&1 | tail -3
+          nm -u a 2>/dev/null | grep -i cout || echo "(no undefined cout)"
+          ./a; echo "A exit: $?"
+          echo "--- mini B: no std.pcm, force_load libc++.a ---"
+          "$clang" -std=c++23 -fmodule-file=mini=a.pcm main.cpp a.pcm -Wl,-force_load,"$pkgroot/lib/libc++.a" -o b 2>&1 | tail -3
+          nm -nm b 2>/dev/null | grep -iE "cout" | grep -iE "data|const" || echo "(no cout data)"
+          ./b; echo "B exit: $?"
+          echo "--- mini C: with std.pcm (mirror mcpp), plain link ---"
+          stdfile=tests/examples/boost-ext.ut/target/aarch64-macos/*/pcm.cache/std.pcm
+          stdfile=$(ls $stdfile 2>/dev/null | head -1)
+          echo "STD=$stdfile"
+          "$clang" -std=c++23 -fmodule-file=std=$stdfile --precompile mini.cppm -o c.pcm 2>&1 | tail -3 && \
+            "$clang" -std=c++23 -fmodule-file=mini=c.pcm -fmodule-file=std=$stdfile main.cpp c.pcm -o c 2>&1 | tail -3
+          ./c; echo "C exit: $?"
+          echo "--- mini D: std.pcm + force_load ---"
+          "$clang" -std=c++23 -fmodule-file=mini=c.pcm -fmodule-file=std=$stdfile main.cpp c.pcm -Wl,-force_load,"$pkgroot/lib/libc++.a" -o d 2>&1 | tail -3
+          ./d; echo "D exit: $?"
