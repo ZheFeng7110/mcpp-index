@@ -74,16 +74,24 @@ jobs:
           ls "$tmp" || true
           $C -o ut_i obj/ut.o obj/boost.ut.m.o "$tmp"/*.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
           runit ut_i "I(force iostream.o)"
-          echo "=== K: cppm + ios_base::Init guard, static link ==="
-          cp "$cppm" /tmp/guarded.cppm
-          python3 -c "p='/tmp/guarded.cppm'; s=open(p).read(); g='namespace {\nstruct [[maybe_unused]] ut_stream_guard { std::ios_base::Init init; };\n[[maybe_unused]] ut_stream_guard ut_ensure_streams{};\n}\n'; m='#define BOOST_UT_CXX_MODULES 1'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('guard injected')"
+          echo "=== K2: cppm GMF-guard (external linkage, before export module), static link ==="
           inc=$(python3 -c "import json;args=json.load(open('$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'];print(' '.join(a for a in args if a.startswith('-I')))")
           echo "INC=$inc"
-          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded.cppm -o obj/guarded.m.o 2>&1 | tail -15 || true
-          $C -o ut_k obj/ut.o obj/guarded.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -5 || true
-          runit ut_k "K(guard static plain)"
-          $C -o ut_l obj/ut.o obj/guarded.m.o -Wl,-dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -5 || true
-          runit ut_l "L(guard dead_strip)"
+          cp "$cppm" /tmp/guarded2.cppm
+          python3 -c "p='/tmp/guarded2.cppm'; s=open(p).read(); g='\n// GMF guard: force libc++ stream construction before ut cfg (static-libc++ init-order workaround)\nstd::ios_base::Init ut_ensure_std_streams_ready_global;\n'; m='export module boost.ut;'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('gmf guard injected')"
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded2.cppm -o obj/guarded2.m.o 2>&1 | tail -10 || true
+          $C -o ut_k2 obj/ut.o obj/guarded2.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -5 || true
+          runit ut_k2 "K2(GMF guard static plain)"
+          $C -o ut_k3 obj/ut.o obj/guarded2.m.o 2>&1 | tail -5 || true
+          runit ut_k3 "K3(GMF guard dylib)"
+          echo "=== K2 init_offsets symbolization ==="
+          offs=$(otool -s __TEXT __init_offsets ut_k2 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
+          printf 'settings set target.disable-aslr true\nrun\n' > /tmp/y.lldb
+          for off in $offs; do addr=$((16#$off)); printf 'image lookup -a 0x%x\n' $((0x100000000 + addr)) >> /tmp/y.lldb; done
+          lldb -b -s /tmp/y.lldb -- ./ut_k2 2>&1 | grep -E "image lookup -a|Summary:|Function:" | head -80 || true
+          echo "=== K2 backtrace (if crashed) ==="
+          printf 'settings set target.disable-aslr true\nrun\nbt\n' > /tmp/z.lldb
+          lldb -b -s /tmp/z.lldb -- ./ut_k2 2>&1 | grep -E "frame #|stop reason|-> " | head -25 || true
           echo "=== O: libc++.a BEFORE user objects ==="
           $C -o ut_o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" obj/ut.o obj/boost.ut.m.o 2>&1 | tail -5 || true
           runit ut_o "O(archive first)"
