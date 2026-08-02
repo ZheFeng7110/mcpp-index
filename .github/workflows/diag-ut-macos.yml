@@ -44,24 +44,18 @@ jobs:
           MCPP_INDEX_MIRROR: GLOBAL
         run: |
           MCPPROOT="$PWD/mcpp-0.0.109-macosx-arm64"
-          echo "=== downloaded mcpp registry layout ==="
-          find "$MCPPROOT/registry" -maxdepth 2 2>/dev/null | head -30 || true
-          echo "=== registry config files (lua/toml/json) ==="
-          find "$MCPPROOT/registry" \( -name "*.lua" -o -name "*.toml" -o -name "*.json" \) 2>/dev/null | head -30 || true
-          echo "=== grep static/libc++/stdlib/runtime in registry (non-xpkgs) ==="
-          grep -rniE "static|libc\+\+|stdlib|dylib|runtime|toolchain" "$MCPPROOT/registry" --include="*.lua" --include="*.toml" --include="*.json" 2>/dev/null | grep -vE "/xpkgs/.*/(include|lib|bin|share)/" | head -40 || true
-          echo "=== any toolchain spec near xpkgs ==="
-          ls -la "$MCPPROOT/registry/data/xpkgs/" 2>/dev/null | head -10 || true
-          ls -la "$MCPPROOT/registry/data/xpkgs/xim-x-llvm/20.1.7/" 2>/dev/null | head -30 || true
-          find "$MCPPROOT/registry/data/xpkgs/xim-x-llvm/20.1.7/" -maxdepth 2 \( -name "*.lua" -o -name "*.toml" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | head -10 || true
-          echo "=== toolchain config content (if any) ==="
-          for f in $(find "$MCPPROOT/registry" -maxdepth 3 \( -name "*.lua" -o -name "*.toml" \) 2>/dev/null | head -5); do echo "--- $f"; head -60 "$f" 2>/dev/null || true; done
-          echo "=== clang link defaults (dry run) ==="
-          clang=$(python3 -c "import json;print(json.load(open('tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'][0])")
-          pkgroot=$(dirname $(dirname $clang))
-          "$clang" -### -nostdinc++ -isystem "$pkgroot/include/c++/v1" --sysroot="$(xcrun --show-sdk-path)" -mmacosx-version-min=14.0 -o /tmp/x tests/examples/boost-ext.ut/target/aarch64-macos/*/obj/ut.o tests/examples/boost-ext.ut/target/aarch64-macos/*/obj/boost.ut.m.o 2>&1 | tr '"' '\n' | grep -E "^\-" | sort -u | tr '\n' ' ' | head -c 2500 || true
-          echo ""
-          echo "=== libc++ libs in toolchain ==="
-          ls -la "$pkgroot/lib/" 2>/dev/null | grep -iE "libc\+\+" || true
-          echo "=== MCPP env knobs (strings in mcpp binary) ==="
-          strings "$MCPPROOT/bin/mcpp" 2>/dev/null | grep -iE "^MCPP_[A-Z_]+$" | sort -u | head -30 || true
+          XP="$MCPPROOT/registry/data/xpkgs/xim-x-llvm/20.1.7"
+          echo "=== .xpkg.lua (toolchain descriptor, full) ==="
+          cat "$XP/.xpkg.lua" 2>/dev/null | head -300 || true
+          echo "=== .mcpp-fixup.json ==="
+          cat "$XP/.mcpp-fixup.json" 2>/dev/null || true
+          echo "=== MCPP_LOG_LEVEL=debug: link command ==="
+          MCPP_LOG_LEVEL=debug "$MCPP" test -p boost-ext.ut > /tmp/mcpp_dbg.log 2>&1 || true
+          grep -niE "clang\+\+.*(-o |libc)|link|ld " /tmp/mcpp_dbg.log | grep -viE "\.md|\.txt|\.hpp|CMake|README|include/|\.lua" | head -25 || true
+          echo "=== MCPP_LOG_LEVEL=trace attempt ==="
+          MCPP_LOG_LEVEL=trace "$MCPP" test -p boost-ext.ut > /tmp/mcpp_trc.log 2>&1 || true
+          grep -niE "clang\+\+.*(-o |\.a)" /tmp/mcpp_trc.log | head -25 || true
+          echo "=== ninja/rsp files anywhere under member ==="
+          find tests/examples/boost-ext.ut -type f \( -name "*.ninja" -o -name "*.rsp" -o -name "*.txt" \) 2>/dev/null | grep -viE "target/aarch64-macos/0fbb0b71bd39a150/(obj|bin)/" | head -20 || true
+          ls -la tests/examples/boost-ext.ut/.mcpp/ 2>/dev/null | head -20 || true
+          find tests/examples/boost-ext.ut/.mcpp -maxdepth 3 2>/dev/null | head -40 || true
