@@ -1,6 +1,8 @@
 name: diag-ut-macos
 
 on:
+  push:
+    branches: [add-boost-ext-ut]
   workflow_dispatch:
 
 jobs:
