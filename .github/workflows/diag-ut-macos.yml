@@ -44,16 +44,7 @@ jobs:
             echo "=== DYLD_PRINT_INITIALIZERS ==="
             DYLD_PRINT_INITIALIZERS=1 "$bin" 2>&1 | tail -100 || true
             echo "=== lldb deep ==="
-            cat > ut.lldb <<'EOF'
-run
-bt
-register read pc sp x0
-disassemble --pc
-image lookup -rn "cout"
-image lookup -rn "DoIOSInit"
-image lookup -rn "start_std_streams"
-image lookup -rn "reporter_junit"
-EOF
+            printf 'run\nbt\nregister read pc sp x0\ndisassemble --pc\nimage lookup -rn "cout"\nimage lookup -rn "DoIOSInit"\nimage lookup -rn "start_std_streams"\nimage lookup -rn "reporter_junit"\n' > ut.lldb
             lldb -b -s ut.lldb -- "$bin" 2>&1 | tail -250 || true
             echo "=== compile_commands (module build flags) ==="
             find tests/examples/boost-ext.ut -name 'compile_commands.json' -exec cat {} \; 2>/dev/null | head -80 || true
@@ -66,29 +57,13 @@ EOF
           clang=$(find "$HOME/.mcpp" tests/examples/boost-ext.ut/.mcpp -name 'clang++' -type f 2>/dev/null | head -1)
           echo "CLANG=$clang"
           mkdir -p /tmp/repro && cd /tmp/repro
-          cat > mini.cppm <<'EOF'
-module;
-#include <iostream>
-export module mini;
-export inline int the_stream = (std::cout.rdbuf() != nullptr) ? 1 : 0;
-EOF
-          cat > main.cpp <<'EOF'
-import mini;
-int main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }
-EOF
-          cat > main_importstd.cpp <<'EOF'
-import std;
-import mini;
-int main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }
-EOF
+          printf 'module;\n#include <iostream>\nexport module mini;\nexport inline int the_stream = (std::cout.rdbuf() != nullptr) ? 1 : 0;\n' > mini.cppm
+          printf 'import mini;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > main.cpp
+          printf 'import std;\nimport mini;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > main_importstd.cpp
           "$clang" -std=c++23 --precompile mini.cppm -o mini.pcm && \
             "$clang" -std=c++23 -fmodule-file=mini=mini.pcm main.cpp mini.pcm -o mini && \
             ./mini; echo "mini(no import std) exit: $?"
           "$clang" -std=c++23 -fmodule-file=mini=mini.pcm main_importstd.cpp mini.pcm -o mini2 && \
             ./mini2; echo "mini(import std) exit: $?"
-          cat > header.cpp <<'EOF'
-#include <iostream>
-inline int h = (std::cout.rdbuf() != nullptr) ? 1 : 0;
-int main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }
-EOF
+          printf '#include <iostream>\ninline int h = (std::cout.rdbuf() != nullptr) ? 1 : 0;\nint main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }\n' > header.cpp
           "$clang" -std=c++23 header.cpp -o header && ./header; echo "header-form exit: $?"
