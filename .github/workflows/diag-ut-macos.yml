@@ -1,0 +1,44 @@
+name: diag-ut-macos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download mcpp 0.0.109
+        shell: bash
+        env:
+          MCPP_ARCHIVE: mcpp-0.0.109-macosx-arm64.tar.gz
+          MCPP_ROOT: mcpp-0.0.109-macosx-arm64
+        run: |
+          curl -L -fsS -o "$MCPP_ARCHIVE" \
+            "https://github.com/mcpp-community/mcpp/releases/download/v0.0.109/${MCPP_ARCHIVE}"
+          tar -xzf "$MCPP_ARCHIVE"
+          root="$PWD/$MCPP_ROOT"
+          mkdir -p "$HOME/.mcpp/registry"
+          cp -a "$root/registry/." "$HOME/.mcpp/registry/"
+          echo "MCPP=$root/bin/mcpp" >> "$GITHUB_ENV"
+          echo "MCPP_VENDORED_XLINGS=$root/registry/bin/xlings" >> "$GITHUB_ENV"
+          echo "$root/bin" >> "$GITHUB_PATH"
+      - name: mcpp test (collect crash)
+        shell: bash
+        env:
+          MCPP_INDEX_MIRROR: GLOBAL
+        run: |
+          "$MCPP" --version
+          "$MCPP" test -p boost-ext.ut || true
+          echo "=== locate binary ==="
+          find tests/examples/boost-ext.ut/target -name 'ut' -type f 2>/dev/null
+          bin=$(find tests/examples/boost-ext.ut/target -name 'ut' -type f 2>/dev/null | head -1)
+          echo "BIN=$bin"
+          if [ -n "$bin" ]; then
+            echo "=== lldb backtrace ==="
+            lldb -b -o run -o bt -- "$bin" 2>&1 | tail -60 || true
+            echo "=== lldb on failed run (no crash? plain run) ==="
+            "$bin" 2>&1 | tail -20 || echo "exit $?"
+          fi
