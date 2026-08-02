@@ -34,13 +34,61 @@ jobs:
         run: |
           "$MCPP" --version
           "$MCPP" test -p boost-ext.ut || true
-          echo "=== locate binary ==="
-          find tests/examples/boost-ext.ut/target -name 'ut' -type f 2>/dev/null
           bin=$(find tests/examples/boost-ext.ut/target -name 'ut' -type f 2>/dev/null | head -1)
           echo "BIN=$bin"
           if [ -n "$bin" ]; then
-            echo "=== lldb backtrace ==="
-            lldb -b -o run -o bt -- "$bin" 2>&1 | tail -60 || true
-            echo "=== lldb on failed run (no crash? plain run) ==="
-            "$bin" 2>&1 | tail -20 || echo "exit $?"
+            echo "=== otool -L ==="
+            otool -L "$bin" || true
+            echo "=== nm: cout / stream / init symbols ==="
+            nm -nm "$bin" 2>/dev/null | grep -iE "cout|iostream|DoIOSInit|start_std_streams|ios_base" || true
+            echo "=== DYLD_PRINT_INITIALIZERS ==="
+            DYLD_PRINT_INITIALIZERS=1 "$bin" 2>&1 | tail -100 || true
+            echo "=== lldb deep ==="
+            cat > ut.lldb <<'EOF'
+run
+bt
+register read pc sp x0
+disassemble --pc
+image lookup -rn "cout"
+image lookup -rn "DoIOSInit"
+image lookup -rn "start_std_streams"
+image lookup -rn "reporter_junit"
+EOF
+            lldb -b -s ut.lldb -- "$bin" 2>&1 | tail -250 || true
+            echo "=== compile_commands (module build flags) ==="
+            find tests/examples/boost-ext.ut -name 'compile_commands.json' -exec cat {} \; 2>/dev/null | head -80 || true
           fi
+      - name: minimal module repro (same toolchain)
+        shell: bash
+        env:
+          MCPP_INDEX_MIRROR: GLOBAL
+        run: |
+          clang=$(find "$HOME/.mcpp" tests/examples/boost-ext.ut/.mcpp -name 'clang++' -type f 2>/dev/null | head -1)
+          echo "CLANG=$clang"
+          mkdir -p /tmp/repro && cd /tmp/repro
+          cat > mini.cppm <<'EOF'
+module;
+#include <iostream>
+export module mini;
+export inline int the_stream = (std::cout.rdbuf() != nullptr) ? 1 : 0;
+EOF
+          cat > main.cpp <<'EOF'
+import mini;
+int main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }
+EOF
+          cat > main_importstd.cpp <<'EOF'
+import std;
+import mini;
+int main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }
+EOF
+          "$clang" -std=c++23 --precompile mini.cppm -o mini.pcm && \
+            "$clang" -std=c++23 -fmodule-file=mini=mini.pcm main.cpp mini.pcm -o mini && \
+            ./mini; echo "mini(no import std) exit: $?"
+          "$clang" -std=c++23 -fmodule-file=mini=mini.pcm main_importstd.cpp mini.pcm -o mini2 && \
+            ./mini2; echo "mini(import std) exit: $?"
+          cat > header.cpp <<'EOF'
+#include <iostream>
+inline int h = (std::cout.rdbuf() != nullptr) ? 1 : 0;
+int main() { return std::cout.rdbuf() != nullptr ? 0 : 1; }
+EOF
+          "$clang" -std=c++23 header.cpp -o header && ./header; echo "header-form exit: $?"
