@@ -1,0 +1,15 @@
+# boost-ext.ut test project: consumes the C++23 module `boost.ut` and
+# asserts two test styles (UDL + function syntax) plus an expect failure
+# under `mcpp test`.
+# Overrides the workspace-root redirect (`compat`): this member needs the
+# `boost-ext` namespace. A member-level [indices] REPLACES the inherited
+# table rather than merging with it — keeps the project index repo to ONE.
+[indices]
+boost-ext = { path = "../../.." }
+
+[package]
+name = "boost-ext-ut-tests"
+version = "0.1.0"
+
+[dependencies.boost-ext]
+ut = "2.3.1"
