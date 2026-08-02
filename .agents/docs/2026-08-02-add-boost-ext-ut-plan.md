@@ -29,7 +29,8 @@
 ## 2. 关键注意事项:上游 ut.cppm 不能逐字内嵌
 
 与 `nlohmann.json`(可 VERBATIM 内嵌)与 `marzer.tomlplusplus`(删一行后 VERBATIM 内嵌)不同,
-上游 `ut-2.3.1/include/boost/ut.cppm` 在 mcpp 0.0.109 的两条非 MSVC 默认 toolchain 上**均无法编译**:
+上游 `ut-2.3.1/include/boost/ut.cppm` 在 mcpp 0.0.109 的三条 CI 平台 default toolchain 上
+**均无法直接使用**:
 
 ### 2.1 GCC 16.1(`-std=c++23`):-Wtemplate-body 拒绝无修饰 `size_t`
 
@@ -56,29 +57,56 @@ ut.hpp:689:63: error: use of undeclared identifier '__argv'; did you mean 'largv
 上设了 `_MSC_VER`,但不提供这两个内建 —— 上游相邻分支(行 291 / 311 / 1147)已通过
 `&& !defined(__clang__)` 排除 clang,行 687 漏了同一守卫。属上游 clang-on-windows 模块适配缺口。
 
-### 2.3 解法:generated_files 内嵌 + 两处最小 shim
+### 2.3 Clang 20.1.7(macOS CI 自装的 default,macos-15):运行期 SIGSEGV(exit 139)
 
-`generated_files` 内嵌的 cppm 在逐字节复用上游 ut.cppm 的基础上**仅**插入两处 shim:
+verbatim ut.cppm 在 macOS CI 上**能编译**,但 `mcpp test` 运行测试二进制立刻 exit 139
+(SIGSEGV),`bin/ut` 输出全无,无 `Suite '...'` 字样。根因:
 
-| shim | 作用 | 守卫 |
+```text
+$ Running bin/ut
+ut ... FAIL (exit 139)
+```
+
+`cfg::runner<reporter_junit<printer>>` 静态对象的 `reporter_junit` 成员默认初始化器
+`active_scope_ = &results_[active_suite_]` 触发 `std::unordered_map<std::string,
+test_result>::operator[]("global")`,该条路径在 `-fmodules` 下顺道访问的几个
+`reporter_junit<>::on<...>` / `test::operator=<>` / `expect<bool>` 模板成员
+在 v2.3.1 ut.cppm 中只有*隐式实例化*路径 —— 缺乏把模板代码从 module 接口单元挤到
+消费方 .o 的导出声明,Apple-Clang 20.1.7 在该路径上的 module BMI 未把这些成员的
+定义带进可执行文件,首次静态初始化的 dispatch 落入未实例化 slot → 段错误。
+
+### 2.4 解法:generated_files 内嵌 + 三处最小偏离
+
+`generated_files` 内嵌的 cppm 在 v2.3.1 ut.cppm 字面之上 **追加/调整** 三处,无任何行被删除:
+
+| 偏离 | 作用 | 守卫/来源 |
 |---|---|---|
-| `using std::size_t;`(purview 顶层) | 修复 GCC 的 `size_t` 未声明 | 无条件 |
-| `#define __argc 0` / `#define __argv ((const char**)nullptr)` | 修复 Clang-on-Windows 的内建缺失 | `_MSC_VER && __clang__` |
+| **dev 1**:v2.3.1 ut.cppm body 逐字保留 | `#include "ut.hpp"` | 全部 |
+| **dev 2a**:purview 顶层 `using std::size_t;` | 修复 GCC `-Wtemplate-body` 无修饰 `size_t` | 无条件 |
+| **dev 2b**:`#define __argc 0` / `#define __argv nullptr` | 修复 Clang-on-Windows 内建缺失 | `_MSC_VER && __clang__`(MSVC 自身不进入) |
+| **dev 3**:文件末尾追加 explicit template instantiation 块 | 修复 §2.3 macOS Clang 20.1.7 SIGSEGV | 8 条 `template ...` 声明,**逐字取自上游 master 的 ut.cppm**(尚未进 v2.3.1;见 §演进) |
 
 要点:
 
-- shim 1 的 `using std::size_t;` 在 purview 全局作用域,ut.hpp 在其内开
-  `export namespace boost::inline ext::ut::inline v2_3_1 { ... }`,namespace block 内对 `size_t`
-  的无修饰查找经 outer-namespace 回溯可见 `::size_t`(由 using 引入)。
-- shim 2 仅在 `__clang__` 定义时启用,MSVC 本身不进入守卫,所以保留 MSVC 真内建行为不变。
-  cfg::largc 在运行时由 ut.hpp 行 3373-3375 从 main argc/argv 重新赋值,宏值始终是占位 0,
-  不影响行为。
-- `BOOST_UT_CXX_MODULES=1` 这一定义照搬自上游 ut.cppm,从而
-  `BOOST_UT_EXPORT` 被定义为 `export`,ut.hpp 行 111 的
-  `BOOST_UT_EXPORT namespace boost::inline ext::ut::inline v2_3_1 { ... }` 即
-  `export namespace boost::inline ext::ut::inline v2_3_1 { ... }`,
-  该 namespace block 内所有声明都随 `export module boost.ut;` 一起 export 到消费者。
-  这是上游 cppm 本来的设计;shims 不破坏该结构。
+- 三处偏离都**加**而**不删**,除 dev 2 的两条 `#define`/`undef` 是对称宏外,
+  其它均为新增内容,不动 ut.hpp、不动 ut.cppm 既有字节。
+- dev 3 的 8 行 explicit-template-instantiation **逐字**来自上游 `master` 分支当前的
+  `include/boost/ut.cppm` 文件末尾(由用户在 review 时提供并指向),仅为做 macOS
+  module-linkage gap 的 forward-port —— 与本仓 `marzer.tomlplusplus` 把 master 的
+  cppm 删一行后内嵌属同一"最小 forward-port 自 master"形态,信任链上只多引一段
+  上游自己写的明示实例化。
+- 演进条件:一旦 ut 出 >2.3.1 release 且 release tarball 的 `include/boost/ut.cppm`
+  自带 dev 3 那块实例化,把 `sources` 切回 `*/include/boost/ut.cppm`、
+  删 `generated_files` 即可(只保留两个 dev-2 shim 时会顺带回落到 generated wrapper;
+  若 >2.3.1 release 还顺带修了 §2.1/§2.2,`generated_files` 整块可移除)。
+- `export import std;` **保留**:试过删它会在 GCC 上引爆一连串 `-Wtemplate-body`
+  error(`std::empty` 在 `gherkin::steps::next`、`utility::match` 在同一处、
+  `literals::operator""_test` 等 literal `using` 块在 ut.hpp:3311-3360)。
+  显式追加 `<iterator>`/`<version>` 等 `#include` 也不能消完,
+  根因实为 GCC 在 module purview 下的两阶段名字查找对未通过 `import std` 进 purview
+  的 stdlib 适配较保守。原作者的 `export import std;` 是当前唯一干净写法,予以保留。
+  其 transitive 行为(消费者 `import boost.ut;` 即可见 stdlib符号)与 `import_std = false`
+  协调:后者仅避免 mcpp 在 wrapper TU 中再注入一次 `import std;`。
 
 `include_dirs = { "*/include/boost" }` 让 wrapper 内的 `#include "ut.hpp"` 解析到 verdir 下的
 实际 ut.hpp;同时消费者若直接 `#include <boost/ut.hpp>` 也能解析(与 nlohmann/marzer 同形式)。
@@ -115,16 +143,21 @@ generated cppm 路径 `mcpp_generated/boost.ut.cppm` 为 verdir 相对(无 glob)
 
 | 检查 | 结果 |
 |---|---|
-| `mcpp xpkg parse pkgs/b/boost-ext.ut.lua`(CI pin 0.0.109 与本地 2026.8.2.1) | ✅ parse OK |
-| 全量 `mcpp xpkg parse pkgs/*/*.lua`(0.0.109) | ✅ 无 PARSE FAIL |
-| `mcpp test -p boost-ext.ut`(gcc 16.1.0,Windows x86_64-windows-gnu 默认 target) | ✅ `all tests passed (3 asserts in 2 tests)` / `test result ok. 1 passed` |
-| `mcpp test -p boost-ext.ut`(llvm 22.1.8,Windows x86_64-windows-msvc target) | ✅ `all tests passed (3 asserts in 2 tests)` / `test result ok. 1 passed` |
+| `mcpp xpkg parse pkgs/b/boost-ext.ut.lua`(本地 2026.8.2.1 与 CI pin 0.0.109) | ✅ parse OK |
+| `mcpp test -p boost-ext.ut`(gcc 16.1.0,Windows x86_64-windows-gnu 默认 target,dev 1+2+3 后) | ✅ `all tests passed (3 asserts in 2 tests)` / `test result ok. 1 passed` |
+| `mcpp test -p boost-ext.ut`(llvm 22.1.8,Windows x86_64-windows-msvc,dev 1+2+3 后) | ✅ `all tests passed (3 asserts in 2 tests)` / `test result ok. 1 passed` |
+| `workspace (linux)` / `workspace (windows)` CI(PR #142 第 1 次推,dev 1+2 仅有) | ✅ pass |
+| `workspace (macos)` CI(PR #142 第 1 次推,dev 1+2 仅有,Clang 20.1.7) | ❌ SIGSEGV exit 139(§2.3)→ 推动 dev 3 |
 | `tests/check_mirror_urls.lua`(手算:plain-string url 直接放行) | ✅ 通过 |
 | `tests/check_package_name.lua`(手算:`name = "ut"` 单一原子段) | ✅ 通过 |
-| 前导 v 版本号 lint(手算:`"2.3.1"` 裸版本) | ✅ 通过 |
+| 前导 v 版本号 lint(手算:`"2.2.3"` 裸版本) | ✅ 通过 |
 
 冷验证前已 `rm -rf tests/examples/boost-ext.ut/{target,.mcpp,mcpp.lock,compile_commands.json}`,
 自干净状态走完"拉 tarball → 编译 wrapper → 编译/链接测试 → 运行"完整管线。
+
+dev 3(explicit template instantiation 块逐字取自上游 master)为 PR #142 CI macOS leg 失败
+(exit 139)的直接修复,根因分析与最终选型见 §2.3/§2.4。修复后本地在 Windows 的两条 default
+toolchain 上均仍通过,显示 dev 3 不引入回归;macOS CI 复检结果以 PR #142 第二次 CI 为准。
 
 ## 7. 其它
 
