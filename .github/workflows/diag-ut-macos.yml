@@ -77,11 +77,22 @@ jobs:
           echo "=== K: cppm + ios_base::Init guard, static link ==="
           cp "$cppm" /tmp/guarded.cppm
           python3 -c "p='/tmp/guarded.cppm'; s=open(p).read(); g='namespace {\nstruct [[maybe_unused]] ut_stream_guard { std::ios_base::Init init; };\n[[maybe_unused]] ut_stream_guard ut_ensure_streams{};\n}\n'; m='#define BOOST_UT_CXX_MODULES 1'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('guard injected')"
-          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body -c /tmp/guarded.cppm -o obj/guarded.m.o 2>&1 | tail -3 || true
-          $C -o ut_k obj/ut.o obj/guarded.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
+          inc=$(python3 -c "import json;args=json.load(open('$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'];print(' '.join(a for a in args if a.startswith('-I')))")
+          echo "INC=$inc"
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded.cppm -o obj/guarded.m.o 2>&1 | tail -15 || true
+          $C -o ut_k obj/ut.o obj/guarded.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -5 || true
           runit ut_k "K(guard static plain)"
-          $C -o ut_l obj/ut.o obj/guarded.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
-          runit ut_l "L(guard no_dead_strip)"
+          $C -o ut_l obj/ut.o obj/guarded.m.o -Wl,-dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -5 || true
+          runit ut_l "L(guard dead_strip)"
+          echo "=== O: libc++.a BEFORE user objects ==="
+          $C -o ut_o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" obj/ut.o obj/boost.ut.m.o 2>&1 | tail -5 || true
+          runit ut_o "O(archive first)"
+          echo "=== P: force_load libc++.a ==="
+          $C -o ut_p obj/ut.o obj/boost.ut.m.o -Wl,-force_load,"$pkgroot/lib/libc++.a" -Wl,-force_load,"$pkgroot/lib/libc++abi.a" 2>&1 | tail -5 || true
+          runit ut_p "P(force_load)"
+          echo "=== M2: xpkg dylib + rpath ==="
+          $C -o ut_m2 obj/ut.o obj/boost.ut.m.o -L"$pkgroot/lib" -lc++ -lc++abi -Wl,-rpath,"$pkgroot/lib" 2>&1 | tail -5 || true
+          runit ut_m2 "M2(xpkg dylib+rpath)"
           echo "=== K init_offsets symbolization ==="
           offs=$(otool -s __TEXT __init_offsets ut_k 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
           printf 'settings set target.disable-aslr true\nrun\n' > /tmp/y.lldb
