@@ -26,18 +26,23 @@
 --   * Clang 20.1.7 (macOS CI's auto-installed default on macos-15) compiles
 --     the verbatim file fine but the resulting test binary SIGSEGVs (exit
 --     139) during static init of `cfg::runner<reporter_junit<printer>>` —
---     no "Suite '...'" output reaches stdout. Root cause: upstream ut.cppm
---     defines the module interface AND opens `export namespace boost::...`
---     but doesn't explicitly instantiate the template members the runner
---     dispatches to (`reporter_junit<>::on(...)`, `test::operator=<>`,
---     `expect<bool>`). On Apple-Clang 20.1.7 with `-fmodules`, the
---     implicit-instantiation path through the module BMI leaves the
---     dispatch targets un-emitted in the consuming executable, so the
---     first `cfg` static-init call into `reporter_junit::on(events::run_begin)`
---     and its `std::unordered_map::operator[]` ends up calling into a
---     non-instantiated / wrong-ABI slot and crashes.
+--     no "Suite '...'" output reaches stdout. A macOS lldb backtrace pins it
+--     exactly:
+--         frame #0: reporter_junit::reporter_junit at ut.hpp:1620:31
+--         stop reason = EXC_BAD_ACCESS (code=1, address=0xffffffffffffffe8)
+--     ut.hpp:1620 is the member-init `std::streambuf* cout_save =
+--     std::cout.rdbuf();`. Root cause is a static-initialization ORDER
+--     failure (SIOF): the module-exported inline variable
+--     `cfg = runner<reporter_junit<printer>>{}` dynamically initializes
+--     BEFORE Apple libc++'s `std::cout`, because libc++ does NOT attach an
+--     init_priority / strong ios_base::Init ordering to its stream objects
+--     the way MSVC STL and libstdc++ do — so `cfg`'s member-init reads an
+--     unconstructed `std::cout` (hence the -0x18 garbage read). The
+--     explicit-template-instantiation fix (below, dev 3) is upstream's
+--     master-side change for a DIFFERENT Clang module codegen gap and does
+--     NOT address this runtime init-order crash.
 --
--- Upstream fixed the macOS/Clang module linkage gap on `master` AFTER v2.3.1
+-- Upstream fixed a separate Clang module LINKAGE gap on `master` AFTER v2.3.1
 -- by appending an explicit-template-instantiation block to ut.cppm — the
 -- exact snippet the user pointed at:
 --     template class boost::ut::reporter_junit<boost::ut::printer>;
@@ -56,28 +61,34 @@
 -- So, like marzer.tomlplusplus, we provide a `generated_files` wrapper that
 -- reproduces upstream's INTENT (ut.hpp included in the module purview with
 -- `BOOST_UT_CXX_MODULES=1`, so the `export namespace boost::...{...}` block
--- ut.hpp opens at line 111 takes everything with it) with TWO deliberate
+-- ut.hpp opens at line 111 takes everything with it) with THREE deliberate
 -- deviations from VERBATIM:
 --   dev 1. The v2.3.1 ut.cppm body is preserved VERBATIM through
 --           `#include "ut.hpp";`.
---   dev 2. TWO minimal compiler-compat shims are ADDED at the top of the
+--   dev 2. THREE minimal compiler-compat shims are ADDED at the top of the
 --          purview before that include:
 --          shim a: `using std::size_t;` — fixes the GCC `-Wtemplate-body`
 --                  unqualified `size_t` error. std::size_t reaches the
---                  module TU through ut.hpp's transitive `#include <array>`
---                  / `<vector>` / `<cstddef>`.
+--                  module TU through `export import std;`.
 --          shim b: `#define __argc 0` / `#define __argv nullptr` gated to
 --                   `__clang__` on `_MSC_VER` — fixes Clang-on-Windows
 --                   (`__argc` / `__argv` builtins missing under
 --                   `_MSC_VER`); MSVC itself never enters the guard.
+--          shim c: a persistent `std::ios_base::Init` guard object — forces
+--                   libc++'s std::cout/std::cin/std::cerr to construct
+--                   BEFORE ut.hpp's `cfg` inline variable reads
+--                   `std::cout.rdbuf()` in reporter_junit's ctor. This is
+--                   THE fix for the macOS SIOF SIGSEGV (see the bullet
+--                   above); without it macOS crashes at ut.hpp:1620.
 --   dev 3. The post-v2.3.1 explicit-template-instantiation block (above) is
---          appended AFTER `#include "ut.hpp"` to force-emission of the
---          member templates the runner dispatches to — closes the
---          macOS-Clang 20.1.7 SIGSEGV gap.
+--          appended AFTER `#include "ut.hpp"`. It is upstream master's fix
+--          for a separate Clang module LINKAGE gap and is kept verbatim
+--          (it is a no-op on GCC/MSVC and harmless on Clang); it does NOT
+--          by itself fix the macOS SIOF — shim c does that.
 --
 -- The base `ut.hpp` stays pinned to the reproducible v2.3.1 release tag —
--- the shims add NO code of our own beyond what the compiler had to see
--- anyway, and the appended instantiation block is upstream master's own
+-- the shims add NO code of our own beyond what the compiler/runtime had to
+-- see anyway, and the appended instantiation block is upstream master's own
 -- byte-for-byte fix.
 --
 -- include_dirs exposes `*/include/boost` so the wrapper's `#include "ut.hpp"`
@@ -183,6 +194,32 @@ using std::size_t;
   #define __argv ((const char**)nullptr)
 #endif
 
+// ---- mcpp-index compat shim 3/3: macOS std::cout static-init order (SIOF) --
+// macOS CI (Apple Clang 20.1.7 + libc++) SIGSEGVs (exit 139) inside
+// `reporter_junit::reporter_junit()` at ut.hpp:1620:
+//     std::streambuf* cout_save = std::cout.rdbuf();
+// EXC_BAD_ACCESS reading 0xffffffffffffffe8 (= -0x18). This is a static
+// initialization ORDER failure: ut.hpp's module-exported inline variable
+// `cfg = runner<reporter_junit<printer>>{}` dynamically initializes BEFORE
+// libc++'s `std::cout` — libc++ has no init_priority on its stream objects,
+// so across the module boundary the runner's member-init `std::cout.rdbuf()`
+// reads an unconstructed `std::cout`. MSVC STL and libstdc++ guard their
+// stream init with init_priority/ios_base::Init ordering, which is why the
+// Windows + Linux legs pass; Apple libc++ does not.
+// Fix: a persistent `std::ios_base::Init` guard object declared HERE, in the
+// module purview BEFORE `#include "ut.hpp"`, so same-TU dynamic init runs it
+// first (declaration order). Its constructor constructs std::cout/std::cin/
+// std::cerr, so when `cfg` (declared later, inside ut.hpp) later reads
+// `std::cout.rdbuf()` the object is fully built. It lives for the whole
+// program, keeping the refcount >= 1 so streams are not torn down early.
+// Anonymous namespace keeps it out of the module's exported interface.
+namespace {
+struct [[maybe_unused]] ut_iostream_guard {
+    std::ios_base::Init init;
+};
+[[maybe_unused]] ut_iostream_guard ut_ensure_std_streams_ready{};
+}
+
 #define BOOST_UT_CXX_MODULES 1
 #include "ut.hpp"
 
@@ -195,16 +232,15 @@ using std::size_t;
 // Lifted VERBATIM from upstream `master`'s include/boost/ut.cppm. v2.3.1's
 // ut.cppm stops at `#include "ut.hpp"`, which leaves the member templates
 // the runner dispatches to (`reporter_junit<>::on<...>`, `test::operator=<>`,
-// `expect<bool>`) only IMPLICITLY instantiable. On Apple-Clang 20.1.7 with
-// `-fmodules`, the implicit path through the module BMI fails to emit them
-// into the consuming executable, so the first `cfg` static-init call into
-// `reporter_junit::on(events::run_begin)` (and its `std::unordered_map::
-// operator[]`) lands in a non-instantiated slot and SIGSEGVs (exit 139).
-// Explicitly instantiating them here forces the emit; MSVC and GCC are
-// unaffected (they instantiate implicitly and tolerate the redundancy).
+// `expect<bool>`) only IMPLICITLY instantiable. Explicitly instantiating
+// them forces emission — upstream's fix for a Clang module linkage gap.
+// NOTE: this does NOT fix the macOS SIOF crash (ut.hpp:1620 `std::cout.rdbuf()`)
+// — shim c above (the std::ios_base::Init guard) is the macOS fix. Keep
+// both: dev 3 is verbatim upstream master, shim c is this index's addition.
 // Once a >2.3.1 release ships this block, switch `sources` to
 // `*/include/boost/ut.cppm` and drop `generated_files`; these lines come
-// back with the verbatim upstream cppm.
+// back with the verbatim upstream cppm (shim c stays until upstream also
+// fixes the libc++ stream-init ordering for modules).
 template class boost::ut::reporter_junit<boost::ut::printer>;
 template void boost::ut::reporter_junit<boost::ut::printer>::on<bool>(boost::ut::events::log<bool>);
 template void boost::ut::reporter_junit<boost::ut::printer>::on<bool>(boost::ut::events::assertion_pass<bool>);
