@@ -27,62 +27,43 @@ jobs:
           echo "MCPP=$root/bin/mcpp" >> "$GITHUB_ENV"
           echo "MCPP_VENDORED_XLINGS=$root/registry/bin/xlings" >> "$GITHUB_ENV"
           echo "$root/bin" >> "$GITHUB_PATH"
-      - name: mcpp test + forensics
+      - name: mcpp test (collect crash)
         shell: bash
         env:
           MCPP_INDEX_MIRROR: GLOBAL
         run: |
           "$MCPP" --version
           "$MCPP" test -p boost-ext.ut || true
-          dir=tests/examples/boost-ext.ut/target/aarch64-macos
-          d=$(ls -d $dir/*/ | head -1)
-          echo "TARGETDIR=$d"
-          bin="$d/bin/ut"
-          echo "=== init sections ==="
-          otool -l "$bin" | grep -iE "sectname" | grep -iE "init|mod" || echo "(none)"
-          echo "=== __TEXT,__init_offsets content ==="
-          otool -s __TEXT __init_offsets "$bin" 2>&1 | head -20
-          echo "=== __DATA,__mod_init_func content ==="
-          otool -s __DATA __mod_init_func "$bin" 2>&1 | head -20
-          echo "=== DoIOSInit / start_std_streams in binary? ==="
-          nm -nm "$bin" 2>/dev/null | grep -iE "DoIOS|start_std" || echo "(NOT PRESENT)"
-          echo "=== iostream.o symbols in binary (cin/cerr/clog)? ==="
-          nm -nm "$bin" 2>/dev/null | grep -iE "4cinE|4cerrE|4clogE" || echo "(NOT PRESENT)"
-          echo "=== ios_base::Init ctor in binary? ==="
-          nm -nm "$bin" 2>/dev/null | grep -iE "ios_base4InitC1|ios_base4InitC2" || echo "(NOT PRESENT)"
-      - name: relink real objects with different policies
+          bin=$(find tests/examples/boost-ext.ut/target -name 'ut' -type f | head -1)
+          echo "BIN=$bin"
+          echo "=== dyld_info -initializers (symbol names!) ==="
+          dyld_info -initializers "$bin" 2>&1 | tail -40 || true
+          echo "=== DYLD_PRINT_INITIALIZERS full (execution order) ==="
+          DYLD_PRINT_INITIALIZERS=1 "$bin" 2>&1 | grep -v "^dyld\[" | head -10 || true
+          DYLD_PRINT_INITIALIZERS=1 "$bin" 2>&1 | grep "^dyld\[" | head -40 || true
+      - name: relink matrix
         shell: bash
         env:
           MCPP_INDEX_MIRROR: GLOBAL
         run: |
           clang=$(python3 -c "import json;print(json.load(open('tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'][0])")
           pkgroot=$(dirname $(dirname $clang))
-          dir=tests/examples/boost-ext.ut/target/aarch64-macos
-          d=$(ls -d $dir/*/ | head -1)
+          d=$(ls -d tests/examples/boost-ext.ut/target/aarch64-macos/*/ | head -1)
           cd "$d"
           C="$clang -nostdinc++ -isystem $pkgroot/include/c++/v1 --sysroot=$(xcrun --show-sdk-path) -mmacosx-version-min=14.0"
-          echo "=== E: dynamic system libc++ (default link) ==="
-          $C -o ut_e obj/ut.o obj/boost.ut.m.o 2>&1 | tail -3
-          otool -L ut_e 2>/dev/null | grep -i c++ || true
-          ./ut_e; echo "E exit: $?"
-          echo "=== F: static libc++.a (plain) ==="
-          $C -o ut_f obj/ut.o obj/boost.ut.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -3
-          otool -L ut_f 2>/dev/null | grep -i c++ || echo "(no libc++ dylib)"
-          ./ut_f; echo "F exit: $?"
-          echo "=== G: static libc++.a + -no_dead_strip ==="
-          $C -o ut_g obj/ut.o obj/boost.ut.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -3
-          ./ut_g; echo "G exit: $?"
-          echo "=== H: static libc++.a + -dead_strip (explicit) ==="
-          $C -o ut_h obj/ut.o obj/boost.ut.m.o -Wl,-dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -3
-          ./ut_h; echo "H exit: $?"
-          echo "=== I: static libc++.a + force_load iostream object ==="
+          runit() { if ./"$1" >/tmp/out.txt 2>&1; then echo "$2 exit: 0 :: $(head -1 /tmp/out.txt)"; else echo "$2 exit: $? :: $(head -1 /tmp/out.txt)"; fi; }
+          $C -o ut_f obj/ut.o obj/boost.ut.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          runit ut_f "F(static plain)"
+          echo "  F initializers:"; dyld_info -initializers ut_f 2>&1 | tail -25
+          $C -o ut_g obj/ut.o obj/boost.ut.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          runit ut_g "G(no_dead_strip)"
+          echo "  G initializers:"; dyld_info -initializers ut_g 2>&1 | tail -25
           tmp=$(mktemp -d)
-          (cd "$tmp" && ar -x "$pkgroot/lib/libc++.a" iostream.cpp.o 2>/dev/null; ls)
-          $C -o ut_i obj/ut.o obj/boost.ut.m.o "$tmp/iostream.cpp.o" "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -3
-          ./ut_i; echo "I exit: $?"
-          echo "=== init_offsets in G (no_dead_strip) vs F (plain) ==="
-          echo "--- F:"; otool -l ut_f | grep -iE "init_offsets|mod_init" || echo none
-          echo "--- G:"; otool -l ut_g | grep -iE "init_offsets|mod_init" || echo none
-          echo "--- G DoIOSInit:"; nm -nm ut_g | grep -iE "DoIOS|start_std" || echo "(NOT PRESENT)"
-          echo "=== DYLD_PRINT_BINDINGS on F (cout binding) ==="
-          DYLD_PRINT_BINDINGS=1 ./ut_f 2>&1 | grep -i "cout" | head -5 || true
+          (cd "$tmp" && ar -x "$pkgroot/lib/libc++.a" iostream.cpp.o 2>/dev/null || true)
+          $C -o ut_i obj/ut.o obj/boost.ut.m.o "$tmp/iostream.cpp.o" "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          runit ut_i "I(force iostream.o)"
+          $C -o ut_m obj/ut.o obj/boost.ut.m.o -L"$pkgroot/lib" -lc++ -lc++abi 2>&1 | tail -2
+          otool -L ut_m 2>/dev/null | grep -i c++ || true
+          runit ut_m "M(xpkg dylib)"
+          $C -o ut_d obj/ut.o obj/boost.ut.m.o -Wl,-dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          runit ut_d "D(dead_strip explicit)"
