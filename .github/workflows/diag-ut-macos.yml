@@ -50,26 +50,23 @@ jobs:
           C="$clang -nostdinc++ -isystem $pkgroot/include/c++/v1 --sysroot=$(xcrun --show-sdk-path) -mmacosx-version-min=14.0"
           runit() { if ./"$1" >/tmp/out.txt 2>&1; then echo "$2 exit: 0 :: $(head -1 /tmp/out.txt)"; else echo "$2 exit: $? :: $(head -1 /tmp/out.txt)"; fi; }
           set +e
-          echo "=== streamtest direct run (sanity) ==="
-          /tmp/streamtest >/dev/null 2>&1
-          echo "streamtest exit: $?"
-          echo "=== S3: purview module-linkage force_init object calling DoIOSInit ==="
+          echo "=== S3b: ALL in GMF — force_init object + external DoIOSInit decl ==="
           cppm=$(find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut" -path '*generated*/boost.ut.cppm' | head -1)
-          cp "$cppm" /tmp/guarded5.cppm
-          python3 -c "p='/tmp/guarded5.cppm'; s=open(p).read(); g='\n// S3: module-linkage guard whose ctor constructs libc++ internal DoIOSInit\nnamespace std { namespace __1 { class DoIOSInit { public: DoIOSInit(); }; } }\nnamespace ut_streams {\nstruct [[maybe_unused]] force_init { force_init() { static std::__1::DoIOSInit i; } };\n[[maybe_unused]] force_init ut_force_ios_init{};\n}\n'; m='#define BOOST_UT_CXX_MODULES 1'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('S3 injected')"
+          cp "$cppm" /tmp/guarded6.cppm
+          python3 -c "p='/tmp/guarded6.cppm'; s=open(p).read(); g='\n// S3b: GMF guard — external-linkage object whose ctor builds libc++ DoIOSInit\nnamespace std { namespace __1 { class DoIOSInit { public: DoIOSInit(); }; } }\nnamespace ut_streams {\nstruct [[maybe_unused]] force_init { force_init() { static std::__1::DoIOSInit i; } };\n[[maybe_unused]] force_init ut_force_ios_init{};\n}\n'; m='export module boost.ut;'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('S3b injected')"
           inc=$(python3 -c "import json;args=json.load(open('$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'];print(' '.join(a for a in args if a.startswith('-I')))")
           stdpcm=$(ls pcm.cache/std.pcm 2>/dev/null)
-          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded5.cppm -o obj/guarded5.m.o 2>&1 | tail -8 || true
-          $C -o ut_s3 obj/ut.o obj/guarded5.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
-          runit ut_s3 "S3(module-linkage DoIOSInit)"
-          if [ -f ut_s3 ]; then
-            echo "=== S3 init order ==="
-            offs=$(otool -s __TEXT __init_offsets ut_s3 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
-            printf 'settings set target.disable-aslr true\nrun\n' > /tmp/s3.lldb
-            for off in $offs; do printf 'image lookup -a 0x%x\n' $((0x100000000 + 16#$off)) >> /tmp/s3.lldb; done
-            lldb -b -s /tmp/s3.lldb -- ./ut_s3 2>&1 | grep -E "Summary:" | head -30 || true
-            echo "=== S3 first guarded5 init disasm ==="
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body $inc -c /tmp/guarded6.cppm -o obj/guarded6.m.o 2>&1 | tail -8 || true
+          $C -o ut_s3b obj/ut.o obj/guarded6.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -4 || true
+          runit ut_s3b "S3b(GMF force_init DoIOSInit)"
+          if [ -f ut_s3b ]; then
+            echo "=== S3b init order ==="
+            offs=$(otool -s __TEXT __init_offsets ut_s3b 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
+            printf 'settings set target.disable-aslr true\nrun\n' > /tmp/s3b.lldb
+            for off in $offs; do printf 'image lookup -a 0x%x\n' $((0x100000000 + 16#$off)) >> /tmp/s3b.lldb; done
+            lldb -b -s /tmp/s3b.lldb -- ./ut_s3b 2>&1 | grep -E "Summary:" | head -30 || true
+            echo "=== S3b first init disasm (is it force_init?) ==="
             off=$(echo $offs | awk '{print $3}')
-            printf 'settings set target.disable-aslr true\nrun\ndisassemble -s 0x%x -c 25\n' $((0x100000000 + 16#$off)) > /tmp/s3b.lldb
-            lldb -b -s /tmp/s3b.lldb -- ./ut_s3 2>&1 | sed -n '/disassemble/,$p' | head -30 || true
+            printf 'settings set target.disable-aslr true\nrun\ndisassemble -s 0x%x -c 25\n' $((0x100000000 + 16#$off)) > /tmp/s3c.lldb
+            lldb -b -s /tmp/s3c.lldb -- ./ut_s3b 2>&1 | sed -n '/disassemble/,$p' | head -30 || true
           fi
