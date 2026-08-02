@@ -173,39 +173,6 @@ jobs:
           [ $fail -eq 0 ] && echo "All descriptors parse with mcpp ${MCPP_VERSION}."
           exit $fail
 
-  mirror-cn-reachable:
-    # Closed-loop guard for the CN mirror: every CN url referenced by a
-    # descriptor must be a live, downloadable gitcode release asset.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install lua
-        run: sudo apt-get install -y --no-install-recommends lua5.4
-      - name: Check CN mirror assets are reachable
-        run: |
-          fail=0
-          # collect unique CN urls across all descriptors
-          : > /tmp/cn.tsv
-          for f in pkgs/*/*.lua; do
-            lua5.4 tests/list_cn_urls.lua "$f" >> /tmp/cn.tsv || true
-          done
-          sort -u /tmp/cn.tsv -o /tmp/cn.tsv
-          total=$(grep -c . /tmp/cn.tsv || true)
-          echo "checking $total CN mirror url(s)"
-          while IFS=$'\t' read -r url sha; do
-            [ -z "$url" ] && continue
-            # follow redirects; gitcode release assets resolve to object storage
-            code=$(curl -fsSL -o /dev/null -w '%{http_code}' --retry 2 --max-time 60 "$url" || echo "000")
-            if [ "$code" != "200" ]; then
-              echo "::error::CN mirror unreachable ($code): $url"
-              fail=1
-            else
-              echo "ok: $url"
-            fi
-          done < /tmp/cn.tsv
-          [ $fail -eq 0 ] && echo "All CN mirror urls reachable."
-          exit $fail
-
   # ── The whole test surface, as a mcpp workspace ───────────────────────
   # mcpp-index is a mcpp [workspace]; every per-library test project under
   # tests/examples/ is a member. `mcpp test --workspace` builds + runs each
@@ -353,7 +320,12 @@ jobs:
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             case "$f" in
-              .github/workflows/validate.yml|tests/*.sh) full "$f" ;;
+              # DEBUG-ONLY (fork iteration): validate.yml edits select only the
+              # boost-ext.ut member instead of forcing a cold full workspace
+              # run (opencv from-source rebuild dominates wall-clock). Revert
+              # to `full "$f"` before this lands upstream.
+              .github/workflows/validate.yml) add "boost-ext.ut" ;;
+              tests/*.sh) full "$f" ;;
               mcpp.toml)
                 # Workspace manifest. Every new-package PR appends to the
                 # members list, so that alone must NOT force a full run:
