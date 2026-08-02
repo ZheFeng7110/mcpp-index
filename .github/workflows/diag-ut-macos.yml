@@ -36,14 +36,16 @@ jobs:
           "$MCPP" test -p boost-ext.ut || true
           bin=$(find tests/examples/boost-ext.ut/target -name 'ut' -type f | head -1)
           echo "BIN=$bin"
+          echo "=== init_offsets entries (raw) ==="
+          otool -s __TEXT __init_offsets "$bin" 2>/dev/null || true
           echo "=== symbolize __init_offsets (ASLR off) ==="
-          offs=$(otool -s __TEXT __init_offsets "$bin" 2>/dev/null | awk '/Contents of/{next} {for(i=1;i<=NF;i++) print $i}')
+          offs=$(otool -s __TEXT __init_offsets "$bin" 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
           printf 'settings set target.disable-aslr true\nrun\n' > /tmp/x.lldb
           for off in $offs; do
             addr=$((16#$off))
             printf 'image lookup -a 0x%x\n' $((0x100000000 + addr)) >> /tmp/x.lldb
           done
-          lldb -b -s /tmp/x.lldb -- "$bin" 2>&1 | grep -E "image lookup|Summary:|Function:|0x100000" | head -60 || true
+          lldb -b -s /tmp/x.lldb -- "$bin" 2>&1 | grep -E "image lookup -a|Summary:|Function:" | head -80 || true
       - name: relink matrix + guard test
         shell: bash
         env:
@@ -51,26 +53,37 @@ jobs:
         run: |
           clang=$(python3 -c "import json;print(json.load(open('tests/examples/boost-ext.ut/compile_commands.json'))[0]['arguments'][0])")
           pkgroot=$(dirname $(dirname $clang))
-          d=$(ls -d tests/examples/boost-ext.ut/target/aarch64-macos/*/ | head -1)
+          d=$(ls -d "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut/target/aarch64-macos"/*/ | head -1)
           cd "$d"
           C="$clang -nostdinc++ -isystem $pkgroot/include/c++/v1 --sysroot=$(xcrun --show-sdk-path) -mmacosx-version-min=14.0"
           stdpcm=$(ls pcm.cache/std.pcm 2>/dev/null)
-          cppm=$(find tests/examples/boost-ext.ut -path '*generated*/boost.ut.cppm' | head -1)
+          cppm=$(find "$GITHUB_WORKSPACE/tests/examples/boost-ext.ut" -path '*generated*/boost.ut.cppm' | head -1)
           echo "CPPM=$cppm STD=$stdpcm"
           runit() { if ./"$1" >/tmp/out.txt 2>&1; then echo "$2 exit: 0 :: $(head -1 /tmp/out.txt)"; else echo "$2 exit: $? :: $(head -1 /tmp/out.txt)"; fi; }
-          $C -o ut_f obj/ut.o obj/boost.ut.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          $C -o ut_f obj/ut.o obj/boost.ut.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
           runit ut_f "F(static plain)"
-          $C -o ut_g obj/ut.o obj/boost.ut.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          $C -o ut_g obj/ut.o obj/boost.ut.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
           runit ut_g "G(no_dead_strip)"
-          echo "=== K: recompile cppm with ios_base::Init guard, static link ==="
+          $C -o ut_d obj/ut.o obj/boost.ut.m.o -Wl,-dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
+          runit ut_d "D(dead_strip explicit)"
+          $C -o ut_m obj/ut.o obj/boost.ut.m.o -L"$pkgroot/lib" -lc++ -lc++abi 2>&1 | tail -2 || true
+          otool -L ut_m 2>/dev/null | grep -i c++ || true
+          runit ut_m "M(xpkg dylib)"
+          tmp=$(mktemp -d)
+          (cd "$tmp" && ar -t "$pkgroot/lib/libc++.a" | grep -i iostream && ar -x "$pkgroot/lib/libc++.a" $(ar -t "$pkgroot/lib/libc++.a" | grep -i iostream) 2>/dev/null) || true
+          ls "$tmp" || true
+          $C -o ut_i obj/ut.o obj/boost.ut.m.o "$tmp"/*.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
+          runit ut_i "I(force iostream.o)"
+          echo "=== K: cppm + ios_base::Init guard, static link ==="
           cp "$cppm" /tmp/guarded.cppm
           python3 -c "p='/tmp/guarded.cppm'; s=open(p).read(); g='namespace {\nstruct [[maybe_unused]] ut_stream_guard { std::ios_base::Init init; };\n[[maybe_unused]] ut_stream_guard ut_ensure_streams{};\n}\n'; m='#define BOOST_UT_CXX_MODULES 1'; assert m in s; open(p,'w').write(s.replace(m, g+m)); print('guard injected')"
-          $C -std=c++23 -fmodule-file=std=$stdpcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body -c /tmp/guarded.cppm -o obj/guarded.m.o 2>&1 | tail -3
-          $C -o ut_k obj/ut.o obj/guarded.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          $C -std=c++23 -fmodule-file=std=$stdpcm -fmodule-file=std.compat=pcm.cache/std.compat.pcm -fprebuilt-module-path=pcm.cache -O0 -g --no-default-config -Wno-template-body -c /tmp/guarded.cppm -o obj/guarded.m.o 2>&1 | tail -3 || true
+          $C -o ut_k obj/ut.o obj/guarded.m.o "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
           runit ut_k "K(guard static plain)"
-          echo "  K initializer order:"; printf 'settings set target.disable-aslr true\nrun\n' > /tmp/y.lldb
-          offs=$(otool -s __TEXT __init_offsets ut_k 2>/dev/null | awk '/Contents of/{next} {for(i=1;i<=NF;i++) print $i}')
-          for off in $offs; do addr=$((16#$off)); printf 'image lookup -a 0x%x\n' $((0x100000000 + addr)) >> /tmp/y.lldb; done
-          lldb -b -s /tmp/y.lldb -- ./ut_k 2>&1 | grep -E "Summary:|Function:" | head -30 || true
-          $C -o ut_l obj/ut.o obj/guarded.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2
+          $C -o ut_l obj/ut.o obj/guarded.m.o -Wl,-no_dead_strip "$pkgroot/lib/libc++.a" "$pkgroot/lib/libc++abi.a" 2>&1 | tail -2 || true
           runit ut_l "L(guard no_dead_strip)"
+          echo "=== K init_offsets symbolization ==="
+          offs=$(otool -s __TEXT __init_offsets ut_k 2>/dev/null | awk 'NR>2 {for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) print $i}')
+          printf 'settings set target.disable-aslr true\nrun\n' > /tmp/y.lldb
+          for off in $offs; do addr=$((16#$off)); printf 'image lookup -a 0x%x\n' $((0x100000000 + addr)) >> /tmp/y.lldb; done
+          lldb -b -s /tmp/y.lldb -- ./ut_k 2>&1 | grep -E "image lookup -a|Summary:|Function:" | head -80 || true
